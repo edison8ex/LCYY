@@ -1,0 +1,76 @@
+import pandas as pd
+import os
+import datetime
+import matplotlib.pyplot as plt
+
+def formatBacktestdata(_ccy):
+    # Formatting
+    _tarCol = ['Open time', 'Open', 'High', 'Low', 'Volume', 'Close']
+    _Dir = os.getcwd()
+    _filename = '{}USDT.xlsx'.format(_ccy)
+    _histData = pd.read_excel(_Dir + _filename, dtype={'Open time':str})[_tarCol].dropna()
+    _histData['datetime'] = pd.to_datetime(_histData['Open time'], format='%Y-%m-%d %H:%M:%S')
+    _histData = _histData.sort_values('datetime').reset_index(drop=True)
+    _histData['date'] = _histData.datetime.dt.date
+    _histData['time'] = _histData.datetime.dt.time
+    _histData['symbol'] = _ccy + '/' + 'USDT'
+    _histData = _histData[['datetime', 'date', 'time', 'symbol'] + _tarCol]
+    _histData = _histData.drop(columns=['Open time'], axis=1)
+    return _histData
+    
+def calRSI(_close:pd.Series, _window_length:int,_mode:str):
+    delta = _close.diff()[1:]
+    up, down = delta.clip(lower=0), delta.clip(upper=0).abs()
+    if _mode == 'EWMA':
+        # Calculate the RSI based on EWMA
+        roll_up = up.ewm(span=_window_length).mean()
+        roll_down = down.ewm(span=_window_length).mean()
+    elif _mode == 'SMA':
+        # Calculate the RSI based on SMA
+        roll_up = up.rolling(_window_length).mean()
+        roll_down = down.rolling(_window_length).mean()
+    elif _mode == 'RMA':
+        # Calculate the RSI based on RMA/SMMA/MMA
+        alpha = 1 / _window_length
+        roll_up = up.ewm(alpha=alpha).mean()
+        roll_down = down.ewm(alpha=alpha).mean()
+    rs = roll_up / roll_down
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return pd.concat([pd.Series([0]), rsi])
+    
+def calSTOSC(_sto:pd.Series, _window_length:int):
+    # Stochastic Oscillator
+    _SOSC = pd.Series([0]*_window_length + \
+            [(_sto[i] - _sto[i:i+_window_length].min()) * 100 /
+            (_sto[i:i+_window_length].max() - _sto[i:i+_window_length].min()) 
+            for i in range(len(_sto)-_window_length)])
+#     Readable code
+#     _SOSC = []
+#     for i in range(len(_sto)-_window_length):
+#         _lookbackPeriod = _sto[i:i+_window_length]
+#         _localmin, _localmax = _lookbackPeriod.min(), _lookbackPeriod.max()
+#         _SOSC.append((_sto[i] - _localmin)/(_localmax - _localmin)*100)
+#     _SOSC = pd.Series([0]*_window_length + _SOSC)
+    return _SOSC
+    
+# Window length for moving average
+_lookback = 14
+_ccy = 'SOL'
+
+# Load data
+data = formatBacktestdata(_ccy)
+display(data)
+
+# OS, RSI, SRSI
+data['OS'] = calSTOSC(_sto=data['Close'], _window_length=_lookback)
+data['RSI'] = calRSI(data['Close'], _window_length=_lookback, _mode='EWMA')
+data['SRSI'] = calSTOSC(_sto=data['RSI'], _window_length=_lookback)
+display(data)
+
+# Compare graphically
+fig, ax1 = plt.subplots(figsize=(24, 6))
+ax2 = ax1.twinx()
+ax1.plot(data.datetime[-500:], data.RSI[-500:], 'r-')
+ax1.plot(data.datetime[-500:], data.SRSI[-500:], 'g-')
+ax2.plot(data.datetime[-500:], close[-500:], 'b-')
+plt.show()
