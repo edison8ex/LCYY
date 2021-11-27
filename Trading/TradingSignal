@@ -55,6 +55,9 @@ def calSTOSC(_sto:pd.Series, _window_length:int):
     
 # Window length for moving average
 _lookback = 14
+# Super trend multiplier
+_multiplier = 3
+# CCY
 _ccy = 'SOL'
 
 # Load data
@@ -70,7 +73,71 @@ display(data)
 # Compare graphically
 fig, ax1 = plt.subplots(figsize=(24, 6))
 ax2 = ax1.twinx()
-ax1.plot(data.datetime[-500:], data.RSI[-500:], 'r-')
-ax1.plot(data.datetime[-500:], data.SRSI[-500:], 'g-')
-ax2.plot(data.datetime[-500:], close[-500:], 'b-')
+#ax1.plot(data.datetime[-500:], data.RSI[-500:], 'r-')
+#ax1.plot(data.datetime[-500:], data.SRSI[-500:], 'g-')
+#ax1.plot(data.datetime[-500:], data.SOS[-500:], 'y-')
+ax2.plot(data.datetime[-500:], data.Close[-500:], 'b-')
+ax2.plot(data.datetime[-500:], st[-500:], 'r-')
 plt.show()
+
+# ATR
+TRHL = pd.DataFrame(data.High - data.Low)
+TRHC = pd.DataFrame(abs(data.High - data.Close.shift(1)))
+TRLC = pd.DataFrame(abs(data.Low - data.Close.shift(1)))
+TR = pd.concat([TRHL, TRHC, TRLC], axis = 1, join = 'inner').max(axis = 1)
+ATR = tr.ewm(_lookback).mean()
+# H/L AVG AND BASIC UPPER & LOWER BAND
+HLA = (data.High + data.Low) / 2
+BUB = (HLA + _multiplier * ATR).dropna()
+BLB = (HLA - _multiplier * ATR).dropna()
+# FINAL BANDS
+final_bands = pd.DataFrame(columns = ['upper', 'lower'])
+final_bands.iloc[:,0] = [x for x in BUB - BUB]
+final_bands.iloc[:,1] = final_bands.iloc[:,0]
+for i in range(len(final_bands)):
+    if i == 0:
+        final_bands.iloc[i,0] = 0
+        final_bands.iloc[i, 1] = 0
+    else:
+        # UPPER
+        if (BUB[i] < final_bands.iloc[i-1,0]) | (data.Close[i-1] > final_bands.iloc[i-1,0]):
+            final_bands.iloc[i,0] = BUB[i]
+        else:
+            final_bands.iloc[i,0] = final_bands.iloc[i-1,0]
+        # LOWER
+        if (BLB[i] > final_bands.iloc[i-1,1]) | (data.Close[i-1] < final_bands.iloc[i-1,1]):
+            final_bands.iloc[i,1] = BLB[i]
+        else:
+            final_bands.iloc[i,1] = final_bands.iloc[i-1,1]
+# SUPERTREND
+supertrend = pd.DataFrame(columns = [f'supertrend_{_lookback}'])
+supertrend.iloc[:,0] = [x for x in final_bands['upper'] - final_bands['upper']]
+for i in range(len(supertrend)):
+    if i == 0:
+        supertrend.iloc[i, 0] = 0
+    elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 0] and data.Close[i] < final_bands.iloc[i, 0]:
+        supertrend.iloc[i, 0] = final_bands.iloc[i, 0]
+    elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 0] and data.Close[i] > final_bands.iloc[i, 0]:
+        supertrend.iloc[i, 0] = final_bands.iloc[i, 1]
+    elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 1] and data.Close[i] > final_bands.iloc[i, 1]:
+        supertrend.iloc[i, 0] = final_bands.iloc[i, 1]
+    elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 1] and data.Close[i] < final_bands.iloc[i, 1]:
+        supertrend.iloc[i, 0] = final_bands.iloc[i, 0]
+supertrend = supertrend.set_index(upper_band.index)
+supertrend = supertrend.dropna()[1:]
+# ST UPTREND/DOWNTREND
+upt = []
+dt = []
+data.Close = data.Close.iloc[len(data.Close) - len(supertrend):]
+for i in range(len(supertrend)):
+    if data.Close[i] > supertrend.iloc[i, 0]:
+        upt.append(supertrend.iloc[i, 0])
+        dt.append(np.nan)
+    elif data.Close[i] < supertrend.iloc[i, 0]:
+        upt.append(np.nan)
+        dt.append(supertrend.iloc[i, 0])
+    else:
+        upt.append(np.nan)
+        dt.append(np.nan)
+st, upt, dt = pd.Series(supertrend.iloc[:, 0]), pd.Series(upt), pd.Series(dt)
+upt.index, dt.index = supertrend.index, supertrend.index
