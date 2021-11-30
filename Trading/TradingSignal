@@ -3,7 +3,7 @@ import os
 import datetime
 import matplotlib.pyplot as plt
 
-def formatBacktestdata(_ccy):
+def formatBacktestdata(_ccy:str):
     # Formatting
     _tarCol = ['Open time', 'Open', 'High', 'Low', 'Volume', 'Close']
     _Dir = os.getcwd()
@@ -53,91 +53,95 @@ def calSTOSC(_sto:pd.Series, _window_length:int):
 #     _SOSC = pd.Series([0]*_window_length + _SOSC)
     return _SOSC
     
-# Window length for moving average
-_lookback = 14
-# Super trend multiplier
-_multiplier = 3
+def calEMA(_close:pd.Series, _window_length:int):
+    return _close.ewm(span=_window_length).mean()
+    
+def calSuperTrend(_close:pd.Series, _high:pd.Series, _low:pd.Series, _window_length:int, _multiplier:int):
+    # Close cross above SuperTrend = Buy
+    # ATR
+    TRHL = pd.DataFrame(_high - _low)
+    TRHC = pd.DataFrame(abs(_high - _close.shift(1)))
+    TRLC = pd.DataFrame(abs(_low - _close.shift(1)))
+    TR = pd.concat([TRHL, TRHC, TRLC], axis = 1, join = 'inner').max(axis = 1)
+    ATR = TR.ewm(_window_length).mean()
+    # H/L AVG AND BASIC UPPER & LOWER BAND
+    HLA = (_high + _low) / 2
+    BUB = (HLA + _multiplier * ATR).dropna()
+    BLB = (HLA - _multiplier * ATR).dropna()
+    # FINAL BANDS
+    final_bands = pd.DataFrame(columns = ['upper', 'lower'])
+    final_bands.iloc[:,0] = [x for x in BUB - BUB]
+    final_bands.iloc[:,1] = final_bands.iloc[:,0]
+    for i in range(len(final_bands)):
+        if i == 0:
+            final_bands.iloc[i,0] = 0
+            final_bands.iloc[i, 1] = 0
+        else:
+            # UPPER
+            if (BUB[i] < final_bands.iloc[i-1,0]) | (_close[i-1] > final_bands.iloc[i-1,0]):
+                final_bands.iloc[i,0] = BUB[i]
+            else:
+                final_bands.iloc[i,0] = final_bands.iloc[i-1,0]
+            # LOWER
+            if (BLB[i] > final_bands.iloc[i-1,1]) | (_close[i-1] < final_bands.iloc[i-1,1]):
+                final_bands.iloc[i,1] = BLB[i]
+            else:
+                final_bands.iloc[i,1] = final_bands.iloc[i-1,1]
+    # SUPERTREND
+    supertrend = pd.DataFrame(columns = [f'supertrend_{_window_length}'])
+    supertrend.iloc[:,0] = [x for x in final_bands['upper'] - final_bands['upper']]
+    for i in range(len(supertrend)):
+        if i == 0:
+            supertrend.iloc[i, 0] = 0
+        elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 0] and _close[i] < final_bands.iloc[i, 0]:
+            supertrend.iloc[i, 0] = final_bands.iloc[i, 0]
+        elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 0] and _close[i] > final_bands.iloc[i, 0]:
+            supertrend.iloc[i, 0] = final_bands.iloc[i, 1]
+        elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 1] and _close[i] > final_bands.iloc[i, 1]:
+            supertrend.iloc[i, 0] = final_bands.iloc[i, 1]
+        elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 1] and _close[i] < final_bands.iloc[i, 1]:
+            supertrend.iloc[i, 0] = final_bands.iloc[i, 0]
+    supertrend = supertrend.set_index(BUB.index)
+    supertrend = supertrend.dropna()[1:]
+    return pd.Series(supertrend.iloc[:, 0])
+
+def BullishOversold(_close:float, _EMA:float, _ST:float, _SRSI:float, _SOS:float):
+    return 1 if (((_SRSI+_SOS)/2 < 20) and ((_close > _EMA) | (_close > _ST))) else 0
+    
 # CCY
-_ccy = 'SOL'
+_ccy = 'ETH'
 
 # Load data
 data = formatBacktestdata(_ccy)
 display(data)
 
-# OS, RSI, SRSI
-data['OS'] = calSTOSC(_sto=data['Close'], _window_length=_lookback)
-data['RSI'] = calRSI(data['Close'], _window_length=_lookback, _mode='EWMA')
-data['SRSI'] = calSTOSC(_sto=data['RSI'], _window_length=_lookback)
+# OverSold - OS, RSI, SRSI
+data['SOS'] = calSTOSC(_sto=data['Close'], _window_length=14)
+data['RSI'] = calRSI(data['Close'], _window_length=14, _mode='EWMA')
+data['SRSI'] = calSTOSC(_sto=data['RSI'], _window_length=14)
+# Bullish Trend - EMA, SuperTrend
+data['EMA{}'.format(14)] = calEMA(_close=data['Close'], _window_length=14)
+data['ST'] = calSuperTrend(_close=data['Close'], _high=data['High'], 
+                           _low=data['Low'], _window_length=14, _multiplier=3)
+# Signal
+data['BullishOversold'] = data[['Close', 'EMA14', 'ST', 'SRSI', 'RSI']].apply(lambda \
+                          x:BullishOversold(x[0], x[1], x[2], x[3], x[4]), axis=1)
+# Actual Y
+data['Actual_Y'] = (data['Close'].shift(-1)/data['Close']-1).apply(lambda x : 1 if x > 0 else 0)
 display(data)
+
+# Precision
+testPeriod = data[(data.date >= datetime.date(2021, 1, 1)) & (data.date <= datetime.date(2021, 10, 31))]
+print('Precision:', (testPeriod.BullishOversold * testPeriod.Actual_Y).sum()/testPeriod.BullishOversold.sum())
 
 # Compare graphically
 fig, ax1 = plt.subplots(figsize=(24, 6))
 ax2 = ax1.twinx()
-#ax1.plot(data.datetime[-500:], data.RSI[-500:], 'r-')
-#ax1.plot(data.datetime[-500:], data.SRSI[-500:], 'g-')
-#ax1.plot(data.datetime[-500:], data.SOS[-500:], 'y-')
+#ax1.plot(data.datetime[-500:], data.RSI[-500:], 'g-')
+ax1.plot(data.datetime[-500:], data.SRSI[-500:], 'g-')
+#ax1.plot(data.datetime[-500:], ((data['SOS'] + data['SRSI'])/2)[-500:], 'g-')
+#ax1.plot(data.datetime[-500:], data.SOS[-500:], 'g-')
 ax2.plot(data.datetime[-500:], data.Close[-500:], 'b-')
-ax2.plot(data.datetime[-500:], st[-500:], 'r-')
+ax2.plot(data.datetime[-500:], data.ST[-500:], 'r-')
+ax2.plot(data.datetime[-500:], data.Close.ewm(span=14).mean()[-500:], 'y-')
 plt.show()
-
-# ATR
-TRHL = pd.DataFrame(data.High - data.Low)
-TRHC = pd.DataFrame(abs(data.High - data.Close.shift(1)))
-TRLC = pd.DataFrame(abs(data.Low - data.Close.shift(1)))
-TR = pd.concat([TRHL, TRHC, TRLC], axis = 1, join = 'inner').max(axis = 1)
-ATR = tr.ewm(_lookback).mean()
-# H/L AVG AND BASIC UPPER & LOWER BAND
-HLA = (data.High + data.Low) / 2
-BUB = (HLA + _multiplier * ATR).dropna()
-BLB = (HLA - _multiplier * ATR).dropna()
-# FINAL BANDS
-final_bands = pd.DataFrame(columns = ['upper', 'lower'])
-final_bands.iloc[:,0] = [x for x in BUB - BUB]
-final_bands.iloc[:,1] = final_bands.iloc[:,0]
-for i in range(len(final_bands)):
-    if i == 0:
-        final_bands.iloc[i,0] = 0
-        final_bands.iloc[i, 1] = 0
-    else:
-        # UPPER
-        if (BUB[i] < final_bands.iloc[i-1,0]) | (data.Close[i-1] > final_bands.iloc[i-1,0]):
-            final_bands.iloc[i,0] = BUB[i]
-        else:
-            final_bands.iloc[i,0] = final_bands.iloc[i-1,0]
-        # LOWER
-        if (BLB[i] > final_bands.iloc[i-1,1]) | (data.Close[i-1] < final_bands.iloc[i-1,1]):
-            final_bands.iloc[i,1] = BLB[i]
-        else:
-            final_bands.iloc[i,1] = final_bands.iloc[i-1,1]
-# SUPERTREND
-supertrend = pd.DataFrame(columns = [f'supertrend_{_lookback}'])
-supertrend.iloc[:,0] = [x for x in final_bands['upper'] - final_bands['upper']]
-for i in range(len(supertrend)):
-    if i == 0:
-        supertrend.iloc[i, 0] = 0
-    elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 0] and data.Close[i] < final_bands.iloc[i, 0]:
-        supertrend.iloc[i, 0] = final_bands.iloc[i, 0]
-    elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 0] and data.Close[i] > final_bands.iloc[i, 0]:
-        supertrend.iloc[i, 0] = final_bands.iloc[i, 1]
-    elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 1] and data.Close[i] > final_bands.iloc[i, 1]:
-        supertrend.iloc[i, 0] = final_bands.iloc[i, 1]
-    elif supertrend.iloc[i-1, 0] == final_bands.iloc[i-1, 1] and data.Close[i] < final_bands.iloc[i, 1]:
-        supertrend.iloc[i, 0] = final_bands.iloc[i, 0]
-supertrend = supertrend.set_index(upper_band.index)
-supertrend = supertrend.dropna()[1:]
-# ST UPTREND/DOWNTREND
-upt = []
-dt = []
-data.Close = data.Close.iloc[len(data.Close) - len(supertrend):]
-for i in range(len(supertrend)):
-    if data.Close[i] > supertrend.iloc[i, 0]:
-        upt.append(supertrend.iloc[i, 0])
-        dt.append(np.nan)
-    elif data.Close[i] < supertrend.iloc[i, 0]:
-        upt.append(np.nan)
-        dt.append(supertrend.iloc[i, 0])
-    else:
-        upt.append(np.nan)
-        dt.append(np.nan)
-st, upt, dt = pd.Series(supertrend.iloc[:, 0]), pd.Series(upt), pd.Series(dt)
-upt.index, dt.index = supertrend.index, supertrend.index
