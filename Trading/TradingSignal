@@ -1,14 +1,17 @@
 import pandas as pd
-import os
+import numpy as np
+import talib
 import datetime
 import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from sklearn.metrics import classification_report, confusion_matrix
 
 def formatBacktestdata(_ccy:str):
     # Formatting
     _tarCol = ['Open time', 'Open', 'High', 'Low', 'Volume', 'Close']
-    _Dir = os.getcwd()
-    _filename = '{}USDT.xlsx'.format(_ccy)
-    _histData = pd.read_excel(_Dir + _filename, dtype={'Open time':str})[_tarCol].dropna()
+    _Dir = "C:\\Users\\LCYY\\Desktop\\CrytoTrade\\Data\\Binance\\"
+    _filename = '{}USDT.csv'.format(_ccy)
+    _histData = pd.read_csv(_Dir + _filename, dtype={'Open time':str})[_tarCol].dropna()
     _histData['datetime'] = pd.to_datetime(_histData['Open time'], format='%Y-%m-%d %H:%M:%S')
     _histData = _histData.sort_values('datetime').reset_index(drop=True)
     _histData['date'] = _histData.datetime.dt.date
@@ -39,7 +42,7 @@ def calRSI(_close:pd.Series, _window_length:int,_mode:str):
     return pd.concat([pd.Series([0]), rsi])
     
 def calSTOSC(_sto:pd.Series, _window_length:int):
-    # Stochastic Oscillator
+    # Stochastic oscillator
     _SOSC = pd.Series([0]*_window_length + \
             [(_sto[i] - _sto[i:i+_window_length].min()) * 100 /
             (_sto[i:i+_window_length].max() - _sto[i:i+_window_length].min()) 
@@ -53,8 +56,24 @@ def calSTOSC(_sto:pd.Series, _window_length:int):
 #     _SOSC = pd.Series([0]*_window_length + _SOSC)
     return _SOSC
     
+def calFastSlowK(_sto:pd.Series, _high:pd.Series, _low:pd.Series, _window_length:int, _smoother:int):
+    # Stochastic Oscillator
+    _localHigh = _high.rolling(_window_length).max()
+    _localLow = _low.rolling(_window_length).min()
+    _FastK = (_sto - _localLow) * 100 / (_localHigh - _localLow)
+    _SlowK = _FastK.rolling(_smoother).mean()
+    return _FastK, _SlowK
+    
 def calEMA(_close:pd.Series, _window_length:int):
     return _close.ewm(span=_window_length).mean()
+    
+def calMACD(_close:pd.Series, _windowK:int, _windowD:int, _windowS:int):
+    _kLine = _close.ewm(span=_windowK).mean()
+    _dLine = _close.ewm(span=_windowD).mean()
+    _macd = _kLine-_dLine
+    _macd_s = _macd.ewm(span=_windowS).mean()
+    _histo = _macd - _macd_s
+    return _macd, _macd_s, _histo
     
 def calSuperTrend(_close:pd.Series, _high:pd.Series, _low:pd.Series, _window_length:int, _multiplier:int):
     # Close cross above SuperTrend = Buy
@@ -104,44 +123,126 @@ def calSuperTrend(_close:pd.Series, _high:pd.Series, _low:pd.Series, _window_len
     supertrend = supertrend.set_index(BUB.index)
     supertrend = supertrend.dropna()[1:]
     return pd.Series(supertrend.iloc[:, 0])
-
-def BullishOversold(_close:float, _EMA:float, _ST:float, _SRSI:float, _SOS:float):
-    return 1 if (((_SRSI+_SOS)/2 < 20) and ((_close > _EMA) | (_close > _ST))) else 0
+    
+def Strat_FastSlowK(_fastK:float, _slowK:float, _thes:int):
+    if ((_fastK < _thes) and (_slowK < _thes) and (_fastK > _slowK)):
+        return 1
+    elif ((_fastK > (100-_thes)) and (_slowK < (100-_thes)) and (_fastK < _slowK)):
+        return -1
+    else:
+        return 0
+        
+def Strat_MACD(_macd:float, _macdS:float, _NmacdH:float):
+    if (_macd > _macdS) and (_NmacdH > 0.75):
+        return 1
+    elif _macd < _macdS and (_NmacdH <= 0.25):
+        return -1
+    else:
+        return 0
+        
+def Strat_BullishOversold(_close:float, _EMA:float, _ST:float, _SRSI:float, _SOS:float):
+    return 1 if (((_SRSI+_SOS)/2 < 20) and ((_close > _EMA) or (_close > _ST))) else 0
+    
+def Gen_backtesting_data(_ccy:str):
+    # Load data
+    data = formatBacktestdata(_ccy)#[:47000]
+    # Normalization
+    data['N_Close'] = ((data.Close - data.Close.min())/(data.Close.max() - data.Close.min()))
+    data['SOS'] = calSTOSC(_sto=data['Close'], _window_length=14)
+    data['SFastK'], data['SSlowK'] = calFastSlowK(_sto=data['Close'], _high=data['High'], _low=data['Low'], \
+                                                  _window_length=14, _smoother=3)
+    data['RSI'] = calRSI(data['N_Close'], _window_length=14, _mode='EWMA')
+    data['SRSI'] = calSTOSC(_sto=data['RSI'], _window_length=14)
+    data['ST'] = calSuperTrend(_close=data['Close'], _high=data['High'], 
+                               _low=data['Low'], _window_length=14, _multiplier=3)
+    data['MACD'], data['MACD_SLine'], data['MACD_Hist'] = calMACD(_close=data['Close'], _windowK=12, \
+                                                            _windowD=26, _windowS=9)
+    data['N_MACD_Hist'] = ((data.MACD_Hist - data.MACD_Hist.min())/(data.MACD_Hist.max() - data.MACD_Hist.min()))
+    return data
+    
+def Gen_backtesting_signal(_data:pd.DataFrame):
+    # Signal
+    _signaldf = pd.DataFrame(data=[x for x in _data.date], columns=['date'])
+    _signaldf['time'] = _data.time
+    # Volume
+    for _vlag in [0, 1, 2, 3, 4, 5, 7, 14, 28]:
+        _signaldf['MinMaxVolume_LAG_{}'.format(_vlag)] = ((_data.Volume - _data.Volume.min()) / \
+                                          (_data.Volume.max() - _data.Volume.min())).shift(_vlag)
+    # Oversold
+    for _threshold in [20, 30, 40]:
+        # Stochastic Oscillator
+        _signaldf['Oversold_S.OSC_{}'.format(_threshold)] = _data['SOS'].apply(lambda x : -1 if x \
+            <= _threshold else 1 if x >= (100-_threshold) else 0)
+        # RSI
+        _signaldf['Oversold_RSI_{}'.format(_threshold)] = _data['RSI'].apply(lambda x : -1 if x \
+            <= _threshold else 1 if x >= (100-_threshold) else 0)
+        # Stochastic RSI
+        _signaldf['Oversold_S.RSI_{}'.format(_threshold)] = _data['SRSI'].apply(lambda x : -1 if x \
+            <= _threshold else 1 if x >= (100-_threshold) else 0)
+        # FastK, SlowK
+        _signaldf['Oversold_FastSlowK_{}'.format(_threshold)] = _data[['SFastK', 'SSlowK']].apply(lambda x : 
+            Strat_FastSlowK(_fastK = x[0], _slowK = x[1], _thes=_threshold), axis=1)
+    # Bullish Trend
+    # Super Trend
+    _signaldf['SuperTrend'] = _data[['Close', 'ST']].apply(lambda x : -1 if x[0] <= x[1] else 1, axis=1)
+    # MACD
+    _signaldf['MACD'] = _data[['MACD', 'MACD_SLine', 'MACD_Hist']].apply(lambda x :
+                        Strat_MACD(_macd = x[0], _macdS = x[1], _NmacdH = x[2]), axis=1)
+    # EMA
+    for _ema in [3, 7, 14, 28]:
+        _data['EMA{}'.format(_ema)] = _data.Close.ewm(span=_ema).mean()
+        _signaldf['EMA_{}'.format(_ema)] = _data[['Close', 'EMA{}'.format(_ema)]].apply(lambda x : -1 if x[0] <= x[1] else 1, axis=1)
+    # Mean-Revert & Short-term Momentum
+    for _lag in [1, 2, 3, 4, 5, 7, 14, 28]:
+        _data['LAG_{}'.format(_lag)] = (_data.Close/_data.Close.shift(_lag)-1)
+        _signaldf['MeanRevert_LAG_{}'.format(_lag)] = _data['LAG_{}'.format(_lag)].apply(lambda x : 1 if x < 0 else 0)
+        _signaldf['CarryMomentum_LAG_{}'.format(_lag)] = _data['LAG_{}'.format(_lag)].apply(lambda x : 1 if x > 0 else 0)
+    # Complicated
+    _signaldf['BullishOversold'] = _data[['Close', 'EMA{}'.format(14), 'ST', 'SRSI', 'SOS']].apply(lambda \
+                              x:Strat_BullishOversold(x[0], x[1], x[2], x[3], x[4]), axis=1)
+    # Y
+    _signaldf['Actual_Y'] = (_data['Close'].shift(-1)/_data['Close']-1).apply(lambda x : 1 if x > 0 else 0)
+    
+    return _signaldf[(_signaldf.date >= datetime.date(2021, 1, 1)) & \
+            (_signaldf.date <= datetime.date(2021, 10, 31))].reset_index(drop=True)
+            
+def Gen_backtesting_fitmodel(_testPeriod:pd.DataFrame):
+    # Model fitting
+    X = _testPeriod.drop(['date', 'time', 'Actual_Y'], axis=1)
+    y = _testPeriod['Actual_Y']
+    model = sm.Logit(y, X)
+    logi = model.fit(method='newton')
+    display(logi.summary())
+    display(confusion_matrix(y, (logi.predict(X) >= 0.5).astype(int)))
+    print(classification_report(y, (logi.predict(X) >= 0.5).astype(int)))
     
 # CCY
-_ccy = 'ETH'
+_ccyList = ['BTC', 'ETH', 'SOL', 'AVAX', 'ADA']#, 'BNB', 'DOGE', 'DOT', 'XRP']
 
-# Load data
-data = formatBacktestdata(_ccy)
-display(data)
+# Gen Data
+_SOL = Gen_backtesting_data('SOL')
+_ETH = Gen_backtesting_data('ETH')
+_BTC = Gen_backtesting_data('BTC')
 
-# OverSold - OS, RSI, SRSI
-data['SOS'] = calSTOSC(_sto=data['Close'], _window_length=14)
-data['RSI'] = calRSI(data['Close'], _window_length=14, _mode='EWMA')
-data['SRSI'] = calSTOSC(_sto=data['RSI'], _window_length=14)
-# Bullish Trend - EMA, SuperTrend
-data['EMA{}'.format(14)] = calEMA(_close=data['Close'], _window_length=14)
-data['ST'] = calSuperTrend(_close=data['Close'], _high=data['High'], 
-                           _low=data['Low'], _window_length=14, _multiplier=3)
 # Signal
-data['BullishOversold'] = data[['Close', 'EMA14', 'ST', 'SRSI', 'RSI']].apply(lambda \
-                          x:BullishOversold(x[0], x[1], x[2], x[3], x[4]), axis=1)
-# Actual Y
-data['Actual_Y'] = (data['Close'].shift(-1)/data['Close']-1).apply(lambda x : 1 if x > 0 else 0)
-display(data)
+_Signal_SOL = Gen_backtesting_signal(_SOL)
+_Signal_ETH = Gen_backtesting_signal(_ETH)
+_Signal_BTC = Gen_backesting_signal(_BTC)
 
-# Precision
-testPeriod = data[(data.date >= datetime.date(2021, 1, 1)) & (data.date <= datetime.date(2021, 10, 31))]
-print('Precision:', (testPeriod.BullishOversold * testPeriod.Actual_Y).sum()/testPeriod.BullishOversold.sum())
+# Model fitting
+Gen_backtesting_fitmodel(_Signal_SOL)
 
 # Compare graphically
+_pres = 500
 fig, ax1 = plt.subplots(figsize=(24, 6))
 ax2 = ax1.twinx()
-#ax1.plot(data.datetime[-500:], data.RSI[-500:], 'g-')
-ax1.plot(data.datetime[-500:], data.SRSI[-500:], 'g-')
-#ax1.plot(data.datetime[-500:], ((data['SOS'] + data['SRSI'])/2)[-500:], 'g-')
-#ax1.plot(data.datetime[-500:], data.SOS[-500:], 'g-')
-ax2.plot(data.datetime[-500:], data.Close[-500:], 'b-')
-ax2.plot(data.datetime[-500:], data.ST[-500:], 'r-')
-ax2.plot(data.datetime[-500:], data.Close.ewm(span=14).mean()[-500:], 'y-')
+#ax1.plot(data.datetime[-_pres:], data.SOSFastK[-_pres:], 'red')
+#ax1.plot(data.datetime[-_pres:], data.SOSSlowK[-_pres:], 'blue')
+
+ax1.plot(data.datetime[-_pres:], data.RSI[-_pres:], 'g-')
+ax1.plot(data.datetime[-_pres:], data.SRSI[-_pres:], 'r-')
+#ax1.plot(data.datetime[-_pres:], data.SOS[-_pres:], 'blue')
+ax2.plot(data.datetime[-_pres:], data.Close[-_pres:], 'black')
+ax2.plot(data.datetime[-_pres:], data.ST[-_pres:], 'orange')
+ax2.plot(data.datetime[-_pres:], data.Close.ewm(span=28).mean()[-_pres:], 'yellow')
 plt.show()
