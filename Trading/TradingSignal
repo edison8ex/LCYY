@@ -5,6 +5,7 @@ import random
 import datetime
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
+import xgboost as xgb
 from sklearn.metrics import classification_report, confusion_matrix
 
 def formatBacktestdata(_ccy:str):
@@ -135,6 +136,9 @@ def calSuperTrend(_close:pd.Series, _high:pd.Series, _low:pd.Series, _window_len
     supertrend = supertrend.dropna()[1:]
     return pd.Series(supertrend.iloc[:, 0])
     
+def Strat_Volume(_N_volume:float, _threshold:float):
+    return 1 if _N_volume >= _threshold else 0
+
 def Strat_FastSlowK(_fastK:float, _slowK:float, _thes:int):
     if ((_fastK < _thes) and (_slowK < _thes) and (_fastK > _slowK)):
         return 1
@@ -161,11 +165,78 @@ def Strat_MACD(_macd:float, _macdS:float, _NmacdH:float):
     
 def Strat_BullishOversold(_close:float, _EMA:float, _ST:float, _SRSI:float, _SOS:float):
     return 1 if (((_SRSI+_SOS)/2 < 20) and ((_close > _EMA) or (_close > _ST))) else 0
+
+def Strat_APO(_APO:pd.Series):    
+    #Absolute price oscillator 
+    #Buy when APO cross from 0 to +ve
+    stoch_signal = []
+    signal = 0
+    for i in range(len(_APO)):
+        if _APO[i] > 0:
+            if signal != 1:
+                signal = 1
+                stoch_signal.append(signal)
+            else:
+                stoch_signal.append(0)
+        elif _APO[i] <= 0:
+            if signal != 0:
+                signal = 0
+                stoch_signal.append(0)
+            else:
+                stoch_signal.append(0)
+        else:
+            stoch_signal.append(0)
+    return stoch_signal
+
+#Aroon
+#IF AROON UP LINE => 70 AND AROON DOWN LINE <= 30 --> BUY SIGNAL
+#IF AROON UP LINE <= 30 AND AROON DOWN LINE >= 70 --> SELL SIGNAL
+def Strat_AROON(_AROONUP:pd.Series, _AROONDown:pd.Series):
+    aroon_signal = []
+    signal = 0
+    for i in range(len(_AROONUP)):
+        if _AROONUP[i] >= 70 and _AROONDown[i] <= 30:
+            if signal != 1:
+                signal = 1
+                aroon_signal.append(signal)
+            else:
+                aroon_signal.append(0)
+        elif _AROONUP[i] <= 30 and _AROONDown[i] >= 70:
+            if signal != -1:
+                signal = -1
+                aroon_signal.append(signal)
+            else:
+                aroon_signal.append(0)
+        else:
+            aroon_signal.append(0)
+    return aroon_signal
+
+#Money flow index
+#MFI < 20 then Buy
+def Strat_MFI(_MFI):
+    MFI_signal = []
+    signal = 0
+    for i in range(len(_MFI)):
+        if _MFI[i] < 20:
+            if signal != 1:
+                signal = 1
+                MFI_signal.append(signal)
+            else:
+                MFI_signal.append(0)
+        elif _MFI[i] >= 0:
+            if signal != 0:
+                signal = 0
+                MFI_signal.append(0)
+            else:
+                MFI_signal.append(0)
+        else:
+            MFI_signal.append(0)
+    return MFI_signal
     
 def Gen_backtesting_data(_ccy:str):
     # Load data
     _data = formatBacktestdata(_ccy)
-    _startDate, _endDate = getRandomPeriod(_date=_data.date.unique(), _numDays=30)
+    _startDate, _endDate = getRandomPeriod(_date=_data.date.unique(), _numDays=90)
     _train = _data[(_data.date >= _startDate) & (_data.date <= _endDate)].reset_index(drop=True)
     _test = _data[(_data.date >= datetime.date(2021, 10, 31))].reset_index(drop=True)
     for data in [_train, _test]:
@@ -181,6 +252,9 @@ def Gen_backtesting_data(_ccy:str):
         data['MACD'], data['MACD_SLine'], data['MACD_Hist'] = calMACD(_close=data['Close'], _windowK=12, \
                                                                 _windowD=26, _windowS=9)
         data['N_MACD_Hist'] = ((data.MACD_Hist - data.MACD_Hist.min())/(data.MACD_Hist.max() - data.MACD_Hist.min()))
+        data['APO'] = talib.APO(data.Close, fastperiod = 4, slowperiod = 6, matype = 0)
+        data['AROONDown'], data['AROONUP'] = talib.AROON(data['High'], data['Low'], timeperiod=14)
+        data['MFI'] = talib.MFI(data['High'], data['Low'], data['Close'], data['Volume'], timeperiod=14)
     return _train, _test
     
 def Gen_backtesting_signal(_data:pd.DataFrame):
@@ -188,9 +262,12 @@ def Gen_backtesting_signal(_data:pd.DataFrame):
     _signaldf = pd.DataFrame(data=[x for x in _data.date], columns=['date'])
     _signaldf['time'] = _data.time
     # Volume
-    for _vlag in [0, 1, 2, 3, 4, 5, 7, 14, 28]:
-        _signaldf['MinMaxVolume_LAG_{}'.format(_vlag)] = ((_data.Volume - _data.Volume.min()) / \
+    for _vlag in [0, 1, 2, 3, 4, 5]:
+        _data['MinMaxVolume_LAG_{}'.format(_vlag)] = ((_data.Volume - _data.Volume.min()) / \
                                           (_data.Volume.max() - _data.Volume.min())).shift(_vlag)
+        _limit = _data['MinMaxVolume_LAG_{}'.format(_vlag)].mean() + _data['MinMaxVolume_LAG_{}'.format(_vlag)].std()
+        _signaldf['Volume_LAG_{}'.format(_vlag)] = _data['MinMaxVolume_LAG_{}'.format(_vlag)].apply(lambda x: 
+            Strat_Volume(_N_volume=x, _threshold=_limit))
     # Oversold
     for _threshold in [20, 25, 30, 40]:
         # Stochastic Oscillator
@@ -216,7 +293,8 @@ def Gen_backtesting_signal(_data:pd.DataFrame):
     # EMA
     for _ema in [3, 7, 14, 28]:
         _data['EMA{}'.format(_ema)] = _data.Close.ewm(span=_ema).mean()
-        _signaldf['EMA_{}'.format(_ema)] = _data[['Close', 'EMA{}'.format(_ema)]].apply(lambda x : -1 if x[0] <= x[1] else 1, axis=1)
+        _signaldf['EMA_{}'.format(_ema)] = _data[['Close', 'EMA{}'.format(_ema)]].apply(lambda x : 
+            -1 if x[0] <= x[1] else 1, axis=1)
     # Mean-Revert & Short-term Momentum
     for _lag in [1, 2, 3, 4, 5, 7, 14, 28]:
         _data['LAG_{}'.format(_lag)] = (_data.Close/_data.Close.shift(_lag)-1)
@@ -225,39 +303,66 @@ def Gen_backtesting_signal(_data:pd.DataFrame):
     # Complicated
     _signaldf['BullishOversold'] = _data[['Close', 'EMA{}'.format(14), 'ST', 'SRSI', 'SOS']].apply(lambda \
                               x:Strat_BullishOversold(x[0], x[1], x[2], x[3], x[4]), axis=1)
+    _signaldf['APO'] = Strat_APO(_APO=_data['APO'])
+    _signaldf['AROON'] = Strat_AROON(_AROONUP=_data['AROONUP'], _AROONDown=_data['AROONDown'])
     # Y
     _signaldf['Actual_Y'] = (_data['Close'].shift(-1)/_data['Close']-1).apply(lambda x : 1 if x > 0 else 0)
     
     return _signaldf[(_signaldf.date > min(_signaldf.date)) & \
             (_signaldf.date < max(_signaldf.date))].reset_index(drop=True)
             
-def Gen_backtesting_fitmodel(_testPeriod:pd.DataFrame):
-    # Model fitting
-    X = _testPeriod.drop(['date', 'time', 'Actual_Y'], axis=1)
-    y = _testPeriod['Actual_Y']
-    model = sm.Logit(y, X)
-    logi = model.fit(method='newton')
-    display(logi.summary())
-    display(confusion_matrix(y, (logi.predict(X) >= 0.5).astype(int)))
-    print(classification_report(y, (logi.predict(X) >= 0.5).astype(int)))
-    
+def Gen_backtesting_fitmodel(_train:pd.DataFrame, _test:pd.DataFrame, _model:str):
+    # Split X, y
+    _trainX = _train.drop(['date', 'time', 'Actual_Y'], axis=1)
+    _trainy = _train['Actual_Y']
+    _testX = _test.drop(['date', 'time', 'Actual_Y'], axis=1)
+    _testy = _test['Actual_Y']
+    # Fit
+    if _model == 'LOGI':
+        model = sm.Logit(_trainy, _trainX)
+        logi = model.fit(method='newton')
+        print('Training Data')
+        display(logi.summary())
+        display(confusion_matrix(_trainy, (logi.predict(_trainX) >= 0.5).astype(int)))
+        print(classification_report(_trainy, (logi.predict(_trainX) >= 0.5).astype(int)))
+        print('Testing Data')
+        display(confusion_matrix(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
+        print(classification_report(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
+    elif _model == 'XGBOOST':
+        fix_params = {'learning_rate': 0.2, 'n_estimators': 100, 'objective': 'binary:logistic', \
+                      'max_depth':6, 'min_child_weight':3, 'max_delta_step': 0, 'subsample':1}
+        xg_reg = xgb.XGBClassifier(**fix_params)
+        xg_reg.fit(_trainX, _trainy)
+        print('Training Data')
+        display(confusion_matrix(_trainy, xg_reg.predict(_trainX)))
+        print(classification_report(_trainy, xg_reg.predict(_trainX)))
+        fig, ax = plt.subplots(figsize=(10,10))
+        xgb.plot_importance(xg_reg, max_num_features=10, height=0.5, ax=ax,importance_type='weight')
+        plt.show()
+        print('Testing Data')
+        display(confusion_matrix(_testy, xg_reg.predict(_testX)))
+        print(classification_report(_testy, xg_reg.predict(_testX)))
+        
 # CCY
 _ccyList = ['BTC', 'ETH', 'SOL', 'AVAX', 'ADA']#, 'BNB', 'DOGE', 'DOT', 'XRP']
-
-# Gen Data
+for _ccy in _ccyList:
+    _Train, _Test = Gen_backtesting_data(_ccy)
+    _Signal_Train, _Signal_Test = Gen_backtesting_signal(_Train), Gen_backtesting_signal(_Test)
+    Gen_backtesting_fitmodel(_train=_Signal_Train, _test=_Signal_Test, _model='XGBOOST')
+    
 _SOLTrain, _SOLTest = Gen_backtesting_data('SOL')
-_ETHTrain, _ETHTest = Gen_backtesting_data('ETH')
-_BTCTrain, _BTCTest = Gen_backtesting_data('BTC')
-_AVAXTrain, _AVAXTest = Gen_backtesting_data('AVAX')
-_ADATrain, _ADATest = Gen_backtesting_data('ADA')
-
-# Signal
 _Signal_SOLTrain, _Signal_SOLTest = Gen_backtesting_signal(_SOLTrain), Gen_backtesting_signal(_SOLTest)
-_Signal_ETHTrain, _Signal_ETHTest = Gen_backtesting_signal(_ETHTrain), Gen_backtesting_signal(_ETHTest)
-_Signal_BTCTrain, _Signal_BTCTest = Gen_backtesting_signal(_BTCTrain), Gen_backtesting_signal(_BTCTest)
-_Signal_AVAXTrain, _Signal_AVAXTest = Gen_backtesting_signal(_AVAXTrain), Gen_backtesting_signal(_AVAXTest)
-_Signal_ADATrain, _Signal_ADATest = Gen_backtesting_signal(_ADATrain), Gen_backtesting_signal(_ADATest)
+Gen_backtesting_fitmodel(_train=_Signal_SOLTrain, _test=_Signal_SOLTest, _model='XGBOOST')
 
-# Change different df for testing
-Gen_backtesting_fitmodel(_Signal_SOLTrain)
-Gen_backtesting_fitmodel(_Signal_SOLTest)
+from sklearn.model_selection import GridSearchCV
+X = _Signal_SOLTrain.drop(['date', 'time', 'Actual_Y'], axis=1)
+y = _Signal_SOLTrain['Actual_Y']
+
+cv_params = {'subsample': [0.8,0.9,1], 'max_delta_step': [0,1,2,4]}
+fix_params = {'learning_rate': 0.2, 'n_estimators': 100, 'objective': 'binary:logistic', 'max_depth':6, 'min_child_weight':3, 
+             'max_delta_step': 0, 'subsample':1}
+
+xg_reg = xgb.XGBClassifier(**fix_params)
+csv = GridSearchCV(xgb.XGBClassifier(**fix_params), cv_params, scoring = 'f1', cv = 5)
+csv.fit(X, y)
+csv.best_params_
