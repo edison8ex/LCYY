@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import talib
+import random
 import datetime
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
@@ -21,6 +22,16 @@ def formatBacktestdata(_ccy:str):
     _histData = _histData.drop(columns=['Open time'], axis=1)
     return _histData
     
+def getRandomPeriod(_date:list, _numDays:int):
+    _minDate = datetime.date(2020, 12, 31)
+    _maxDate = datetime.date(2021, 10, 31)
+    _startPeriod = random.choice(_date)
+    _endPeriod = _startPeriod + datetime.timedelta(days=_numDays)
+    if (_startPeriod >= _minDate) and (_endPeriod <= _maxDate) :
+        return _startPeriod, _endPeriod
+    else:
+        return getRandomPeriod(_date, _numDays)
+        
 def calRSI(_close:pd.Series, _window_length:int,_mode:str):
     delta = _close.diff()[1:]
     up, down = delta.clip(lower=0), delta.clip(upper=0).abs()
@@ -131,7 +142,15 @@ def Strat_FastSlowK(_fastK:float, _slowK:float, _thes:int):
         return -1
     else:
         return 0
-        
+    
+def Strat_KDSwing(_fastK:float, _slowK:float, _thes:int):
+    if ((_fastK < _thes) and (_slowK < _thes) and (abs(_fastK/_slowK-1) < 0.02)):
+        return 1
+    elif ((_fastK > (100-_thes)) and (_slowK < (100-_thes)) and (abs(_fastK/_slowK-1) < 0.02)):
+        return -1
+    else:
+        return 0
+    
 def Strat_MACD(_macd:float, _macdS:float, _NmacdH:float):
     if (_macd > _macdS) and (_NmacdH > 0.75):
         return 1
@@ -139,26 +158,30 @@ def Strat_MACD(_macd:float, _macdS:float, _NmacdH:float):
         return -1
     else:
         return 0
-        
+    
 def Strat_BullishOversold(_close:float, _EMA:float, _ST:float, _SRSI:float, _SOS:float):
     return 1 if (((_SRSI+_SOS)/2 < 20) and ((_close > _EMA) or (_close > _ST))) else 0
     
 def Gen_backtesting_data(_ccy:str):
     # Load data
-    data = formatBacktestdata(_ccy)#[:47000]
-    # Normalization
-    data['N_Close'] = ((data.Close - data.Close.min())/(data.Close.max() - data.Close.min()))
-    data['SOS'] = calSTOSC(_sto=data['Close'], _window_length=14)
-    data['SFastK'], data['SSlowK'] = calFastSlowK(_sto=data['Close'], _high=data['High'], _low=data['Low'], \
-                                                  _window_length=14, _smoother=3)
-    data['RSI'] = calRSI(data['N_Close'], _window_length=14, _mode='EWMA')
-    data['SRSI'] = calSTOSC(_sto=data['RSI'], _window_length=14)
-    data['ST'] = calSuperTrend(_close=data['Close'], _high=data['High'], 
-                               _low=data['Low'], _window_length=14, _multiplier=3)
-    data['MACD'], data['MACD_SLine'], data['MACD_Hist'] = calMACD(_close=data['Close'], _windowK=12, \
-                                                            _windowD=26, _windowS=9)
-    data['N_MACD_Hist'] = ((data.MACD_Hist - data.MACD_Hist.min())/(data.MACD_Hist.max() - data.MACD_Hist.min()))
-    return data
+    _data = formatBacktestdata(_ccy)
+    _startDate, _endDate = getRandomPeriod(_date=_data.date.unique(), _numDays=30)
+    _train = _data[(_data.date >= _startDate) & (_data.date <= _endDate)].reset_index(drop=True)
+    _test = _data[(_data.date >= datetime.date(2021, 10, 31))].reset_index(drop=True)
+    for data in [_train, _test]:
+        # Normalization
+        data['N_Close'] = ((data.Close - data.Close.min())/(data.Close.max() - data.Close.min()))
+        data['SOS'] = calSTOSC(_sto=data['Close'], _window_length=14)
+        data['SFastK'], data['SSlowK'] = calFastSlowK(_sto=data['Close'], _high=data['High'], _low=data['Low'], \
+                                                      _window_length=14, _smoother=3)
+        data['RSI'] = calRSI(data['N_Close'], _window_length=14, _mode='EWMA')
+        data['SRSI'] = calSTOSC(_sto=data['RSI'], _window_length=14)
+        data['ST'] = calSuperTrend(_close=data['Close'], _high=data['High'], 
+                                   _low=data['Low'], _window_length=14, _multiplier=3)
+        data['MACD'], data['MACD_SLine'], data['MACD_Hist'] = calMACD(_close=data['Close'], _windowK=12, \
+                                                                _windowD=26, _windowS=9)
+        data['N_MACD_Hist'] = ((data.MACD_Hist - data.MACD_Hist.min())/(data.MACD_Hist.max() - data.MACD_Hist.min()))
+    return _train, _test
     
 def Gen_backtesting_signal(_data:pd.DataFrame):
     # Signal
@@ -169,7 +192,7 @@ def Gen_backtesting_signal(_data:pd.DataFrame):
         _signaldf['MinMaxVolume_LAG_{}'.format(_vlag)] = ((_data.Volume - _data.Volume.min()) / \
                                           (_data.Volume.max() - _data.Volume.min())).shift(_vlag)
     # Oversold
-    for _threshold in [20, 30, 40]:
+    for _threshold in [20, 25, 30, 40]:
         # Stochastic Oscillator
         _signaldf['Oversold_S.OSC_{}'.format(_threshold)] = _data['SOS'].apply(lambda x : -1 if x \
             <= _threshold else 1 if x >= (100-_threshold) else 0)
@@ -182,6 +205,8 @@ def Gen_backtesting_signal(_data:pd.DataFrame):
         # FastK, SlowK
         _signaldf['Oversold_FastSlowK_{}'.format(_threshold)] = _data[['SFastK', 'SSlowK']].apply(lambda x : 
             Strat_FastSlowK(_fastK = x[0], _slowK = x[1], _thes=_threshold), axis=1)
+        _signaldf['Oversold_KD_{}'.format(_threshold)] = _data[['SFastK', 'SSlowK']].apply(lambda x : 
+            Strat_KDSwing(_fastK = x[0], _slowK = x[1], _thes=_threshold), axis=1)
     # Bullish Trend
     # Super Trend
     _signaldf['SuperTrend'] = _data[['Close', 'ST']].apply(lambda x : -1 if x[0] <= x[1] else 1, axis=1)
@@ -203,8 +228,8 @@ def Gen_backtesting_signal(_data:pd.DataFrame):
     # Y
     _signaldf['Actual_Y'] = (_data['Close'].shift(-1)/_data['Close']-1).apply(lambda x : 1 if x > 0 else 0)
     
-    return _signaldf[(_signaldf.date >= datetime.date(2021, 1, 1)) & \
-            (_signaldf.date <= datetime.date(2021, 10, 31))].reset_index(drop=True)
+    return _signaldf[(_signaldf.date > min(_signaldf.date)) & \
+            (_signaldf.date < max(_signaldf.date))].reset_index(drop=True)
             
 def Gen_backtesting_fitmodel(_testPeriod:pd.DataFrame):
     # Model fitting
@@ -220,29 +245,19 @@ def Gen_backtesting_fitmodel(_testPeriod:pd.DataFrame):
 _ccyList = ['BTC', 'ETH', 'SOL', 'AVAX', 'ADA']#, 'BNB', 'DOGE', 'DOT', 'XRP']
 
 # Gen Data
-_SOL = Gen_backtesting_data('SOL')
-_ETH = Gen_backtesting_data('ETH')
-_BTC = Gen_backtesting_data('BTC')
+_SOLTrain, _SOLTest = Gen_backtesting_data('SOL')
+_ETHTrain, _ETHTest = Gen_backtesting_data('ETH')
+_BTCTrain, _BTCTest = Gen_backtesting_data('BTC')
+_AVAXTrain, _AVAXTest = Gen_backtesting_data('AVAX')
+_ADATrain, _ADATest = Gen_backtesting_data('ADA')
 
 # Signal
-_Signal_SOL = Gen_backtesting_signal(_SOL)
-_Signal_ETH = Gen_backtesting_signal(_ETH)
-_Signal_BTC = Gen_backesting_signal(_BTC)
+_Signal_SOLTrain, _Signal_SOLTest = Gen_backtesting_signal(_SOLTrain), Gen_backtesting_signal(_SOLTest)
+_Signal_ETHTrain, _Signal_ETHTest = Gen_backtesting_signal(_ETHTrain), Gen_backtesting_signal(_ETHTest)
+_Signal_BTCTrain, _Signal_BTCTest = Gen_backtesting_signal(_BTCTrain), Gen_backtesting_signal(_BTCTest)
+_Signal_AVAXTrain, _Signal_AVAXTest = Gen_backtesting_signal(_AVAXTrain), Gen_backtesting_signal(_AVAXTest)
+_Signal_ADATrain, _Signal_ADATest = Gen_backtesting_signal(_ADATrain), Gen_backtesting_signal(_ADATest)
 
-# Model fitting
-Gen_backtesting_fitmodel(_Signal_SOL)
-
-# Compare graphically
-_pres = 500
-fig, ax1 = plt.subplots(figsize=(24, 6))
-ax2 = ax1.twinx()
-#ax1.plot(data.datetime[-_pres:], data.SOSFastK[-_pres:], 'red')
-#ax1.plot(data.datetime[-_pres:], data.SOSSlowK[-_pres:], 'blue')
-
-ax1.plot(data.datetime[-_pres:], data.RSI[-_pres:], 'g-')
-ax1.plot(data.datetime[-_pres:], data.SRSI[-_pres:], 'r-')
-#ax1.plot(data.datetime[-_pres:], data.SOS[-_pres:], 'blue')
-ax2.plot(data.datetime[-_pres:], data.Close[-_pres:], 'black')
-ax2.plot(data.datetime[-_pres:], data.ST[-_pres:], 'orange')
-ax2.plot(data.datetime[-_pres:], data.Close.ewm(span=28).mean()[-_pres:], 'yellow')
-plt.show()
+# Change different df for testing
+Gen_backtesting_fitmodel(_Signal_SOLTrain)
+Gen_backtesting_fitmodel(_Signal_SOLTest)
