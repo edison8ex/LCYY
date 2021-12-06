@@ -6,6 +6,9 @@ import datetime
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
 import xgboost as xgb
+from sklearn import preprocessing
+from sklearn.linear_model import LogisticRegression
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.metrics import classification_report, confusion_matrix
 
 def formatBacktestdata(_ccy:str):
@@ -54,18 +57,16 @@ def calRSI(_close:pd.Series, _window_length:int,_mode:str):
     return pd.concat([pd.Series([0]), rsi])
     
 def calSTOSC(_sto:pd.Series, _window_length:int):
-    # Stochastic oscillator
-    _SOSC = pd.Series([0]*_window_length + \
-            [(_sto[i] - _sto[i:i+_window_length].min()) * 100 /
-            (_sto[i:i+_window_length].max() - _sto[i:i+_window_length].min()) 
-            for i in range(len(_sto)-_window_length)])
-#     Readable code
-#     _SOSC = []
-#     for i in range(len(_sto)-_window_length):
-#         _lookbackPeriod = _sto[i:i+_window_length]
-#         _localmin, _localmax = _lookbackPeriod.min(), _lookbackPeriod.max()
-#         _SOSC.append((_sto[i] - _localmin)/(_localmax - _localmin)*100)
-#     _SOSC = pd.Series([0]*_window_length + _SOSC)
+    # Stochastic
+    _SOSC = []
+    for i in range(len(_sto)-_window_length):
+        _lookbackPeriod = _sto[i:i+_window_length]
+        _localmin, _localmax = _lookbackPeriod.min(), _lookbackPeriod.max()
+        if _localmax - _localmin == 0:
+            _SOSC.append(0)
+        else:
+            _SOSC.append((_sto[i] - _localmin)/(_localmax - _localmin)*100)
+    _SOSC = pd.Series([0]*_window_length + _SOSC)
     return _SOSC
     
 def calFastSlowK(_sto:pd.Series, _high:pd.Series, _low:pd.Series, _window_length:int, _smoother:int):
@@ -236,25 +237,25 @@ def Strat_MFI(_MFI):
 def Gen_backtesting_data(_ccy:str):
     # Load data
     _data = formatBacktestdata(_ccy)
-    _startDate, _endDate = getRandomPeriod(_date=_data.date.unique(), _numDays=90)
+    _startDate, _endDate = getRandomPeriod(_date=_data.date.unique(), _numDays=180)
     _train = _data[(_data.date >= _startDate) & (_data.date <= _endDate)].reset_index(drop=True)
     _test = _data[(_data.date >= datetime.date(2021, 10, 31))].reset_index(drop=True)
-    for data in [_train, _test]:
-        # Normalization
-        data['N_Close'] = ((data.Close - data.Close.min())/(data.Close.max() - data.Close.min()))
-        data['SOS'] = calSTOSC(_sto=data['Close'], _window_length=14)
-        data['SFastK'], data['SSlowK'] = calFastSlowK(_sto=data['Close'], _high=data['High'], _low=data['Low'], \
-                                                      _window_length=14, _smoother=3)
-        data['RSI'] = calRSI(data['N_Close'], _window_length=14, _mode='EWMA')
-        data['SRSI'] = calSTOSC(_sto=data['RSI'], _window_length=14)
-        data['ST'] = calSuperTrend(_close=data['Close'], _high=data['High'], 
-                                   _low=data['Low'], _window_length=14, _multiplier=3)
-        data['MACD'], data['MACD_SLine'], data['MACD_Hist'] = calMACD(_close=data['Close'], _windowK=12, \
-                                                                _windowD=26, _windowS=9)
-        data['N_MACD_Hist'] = ((data.MACD_Hist - data.MACD_Hist.min())/(data.MACD_Hist.max() - data.MACD_Hist.min()))
-        data['APO'] = talib.APO(data.Close, fastperiod = 4, slowperiod = 6, matype = 0)
-        data['AROONDown'], data['AROONUP'] = talib.AROON(data['High'], data['Low'], timeperiod=14)
-        data['MFI'] = talib.MFI(data['High'], data['Low'], data['Close'], data['Volume'], timeperiod=14)
+#     for data in [_train, _test]:
+#         # Normalization
+# #         data['SOS'] = calSTOSC(_sto=data['Close'], _window_length=14)
+# #         data['SFastK'], data['SSlowK'] = calFastSlowK(_sto=data['Close'], _high=data['High'], _low=data['Low'], \
+# #                                                       _window_length=14, _smoother=3)
+# #         data['RSI'] = calRSI(data['Close'], _window_length=14, _mode='EWMA')
+# #         data['SRSI'] = calSTOSC(_sto=data['RSI'], _window_length=14)
+# #         data['SVOL'] = calSTOSC(_sto=data['Volume'], _window_length=14)
+# #         data['ST'] = calSuperTrend(_close=data['Close'], _high=data['High'], 
+# #                                    _low=data['Low'], _window_length=14, _multiplier=3)
+# #         data['MACD'], data['MACD_SLine'], data['MACD_Hist'] = calMACD(_close=data['Close'], _windowK=12, \
+# #                                                                 _windowD=26, _windowS=9)
+# #         data['N_MACD_Hist'] = ((data.MACD_Hist - data.MACD_Hist.min())/(data.MACD_Hist.max() - data.MACD_Hist.min()))
+# #         data['APO'] = talib.APO(data.Close, fastperiod = 4, slowperiod = 6, matype = 0)
+# #         data['AROONDown'], data['AROONUP'] = talib.AROON(data['High'], data['Low'], timeperiod=14)
+# #         data['MFI'] = talib.MFI(data['High'], data['Low'], data['Close'], data['Volume'], timeperiod=14)
     return _train, _test
     
 def Gen_backtesting_signal(_data:pd.DataFrame):
@@ -288,7 +289,7 @@ def Gen_backtesting_signal(_data:pd.DataFrame):
     # Super Trend
     _signaldf['SuperTrend'] = _data[['Close', 'ST']].apply(lambda x : -1 if x[0] <= x[1] else 1, axis=1)
     # MACD
-    _signaldf['MACD'] = _data[['MACD', 'MACD_SLine', 'MACD_Hist']].apply(lambda x :
+    _signaldf['MACD'] = _data[['MACD', 'MACD_SLine', 'N_MACD_Hist']].apply(lambda x :
                         Strat_MACD(_macd = x[0], _macdS = x[1], _NmacdH = x[2]), axis=1)
     # EMA
     for _ema in [3, 7, 14, 28]:
@@ -311,6 +312,19 @@ def Gen_backtesting_signal(_data:pd.DataFrame):
     return _signaldf[(_signaldf.date > min(_signaldf.date)) & \
             (_signaldf.date < max(_signaldf.date))].reset_index(drop=True)
             
+def Gen_FeaturesSelection(_train:pd.DataFrame):
+    # Feature Selection
+    X = _train.drop(['date', 'time', 'Actual_Y'], axis=1)
+    y = _train['Actual_Y']
+    # define the model
+    model = LogisticRegression(solver='lbfgs', max_iter=1000)
+    # fit the model
+    model.fit(X, y)
+    # get importance
+    importances_SOL = pd.DataFrame(data={'Attribute': X.columns, 'Importance': model.coef_[0]})
+    importances_SOL = importances_SOL.sort_values(by='Importance', ascending=False).reset_index(drop=True)
+    return (importances_SOL)
+    
 def Gen_backtesting_fitmodel(_train:pd.DataFrame, _test:pd.DataFrame, _model:str):
     # Split X, y
     _trainX = _train.drop(['date', 'time', 'Actual_Y'], axis=1)
@@ -320,7 +334,7 @@ def Gen_backtesting_fitmodel(_train:pd.DataFrame, _test:pd.DataFrame, _model:str
     # Fit
     if _model == 'LOGI':
         model = sm.Logit(_trainy, _trainX)
-        logi = model.fit(method='newton')
+        logi = model.fit(solver='lbfgs', max_iter=1000)
         print('Training Data')
         display(logi.summary())
         display(confusion_matrix(_trainy, (logi.predict(_trainX) >= 0.5).astype(int)))
@@ -329,8 +343,9 @@ def Gen_backtesting_fitmodel(_train:pd.DataFrame, _test:pd.DataFrame, _model:str
         display(confusion_matrix(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
         print(classification_report(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
     elif _model == 'XGBOOST':
-        fix_params = {'learning_rate': 0.2, 'n_estimators': 100, 'objective': 'binary:logistic', \
-                      'max_depth':6, 'min_child_weight':3, 'max_delta_step': 0, 'subsample':1}
+        fix_params = {'objective': 'binary:logistic', 'eval_metric':'mlogloss', \
+                      'colsample_bytree': 0.35, 'eta': 0.05, 'max_depth': 5, \
+                      'n_estimators': 50, 'subsample': 0.45}
         xg_reg = xgb.XGBClassifier(**fix_params)
         xg_reg.fit(_trainX, _trainy)
         print('Training Data')
@@ -343,26 +358,175 @@ def Gen_backtesting_fitmodel(_train:pd.DataFrame, _test:pd.DataFrame, _model:str
         display(confusion_matrix(_testy, xg_reg.predict(_testX)))
         print(classification_report(_testy, xg_reg.predict(_testX)))
         
-# CCY
+# Feature Selection
+_ccyList = ['BTC', 'ETH', 'SOL', 'AVAX', 'ADA']
+_fsList = []
+for _ccy in _ccyList:
+    _Train, _Test = Gen_backtesting_data(_ccy)
+    _Signal_Train, _Signal_Test = Gen_backtesting_signal(_Train), Gen_backtesting_signal(_Test)
+    _FS = Gen_FeaturesSelection(_Signal_Train)
+    _fsList.append(_FS)
+concat_imp = pd.concat(_fsList)
+_features_avg = concat_imp.groupby(pd.Grouper(key='Attribute')).mean()
+_features_avg = _features_avg.sort_values(by='Importance', ascending=False)
+_selectedFeatures = _features_avg[:10].index
+
+# Model Evaluation
 _ccyList = ['BTC', 'ETH', 'SOL', 'AVAX', 'ADA']#, 'BNB', 'DOGE', 'DOT', 'XRP']
 for _ccy in _ccyList:
     _Train, _Test = Gen_backtesting_data(_ccy)
     _Signal_Train, _Signal_Test = Gen_backtesting_signal(_Train), Gen_backtesting_signal(_Test)
-    Gen_backtesting_fitmodel(_train=_Signal_Train, _test=_Signal_Test, _model='XGBOOST')
+    _Signal_Train_FS, _Signal_Test_FS = _Signal_Train[_selectedFeatures], _Signal_Test[_selectedFeatures]
+    Gen_backtesting_fitmodel(_train=_Signal_Train, _test=_Signal_Test, _model='LOGI')
+    
+def Gen_backtesting_data(_ccy:str):
+    # Load data
+    _data = formatBacktestdata(_ccy)
+    _startDate, _endDate = getRandomPeriod(_date=_data.date.unique(), _numDays=180)
+    _train = _data[(_data.date >= _startDate) & (_data.date <= _endDate)].reset_index(drop=True)
+    _test = _data[(_data.date >= datetime.date(2021, 10, 31))].reset_index(drop=True)
+    for data in [_train, _test]:
+        # Normalization
+        # Return Lag
+        for _lag in [1, 2, 3, 4, 5, 7, 14, 28]:
+            data['Return_LAG_{}'.format(_lag)] = (data.Close/data.Close.shift(_lag)-1)
+        # Realized Volatility
+        for _rv in [15, 30, 60, 180, 360, 720, 1440]:
+            ann_factor = 1440 * 365 / _rv
+            data['RealizedVol_Window_{}'.format(_rv)] = np.sqrt(np.square(data.Return_LAG_1).rolling(_rv).sum()*ann_factor)
+        # ADTV
+        for _adtv in [3, 5, 15, 30, 60, 180, 360, 1440]:
+            data['ADTV_{}'.format(_adtv)] = data.Volume.rolling(window=_adtv).mean().shift(1)
+            
+    return _train, _test
     
 _SOLTrain, _SOLTest = Gen_backtesting_data('SOL')
-_Signal_SOLTrain, _Signal_SOLTest = Gen_backtesting_signal(_SOLTrain), Gen_backtesting_signal(_SOLTest)
-Gen_backtesting_fitmodel(_train=_Signal_SOLTrain, _test=_Signal_SOLTest, _model='XGBOOST')
 
-from sklearn.model_selection import GridSearchCV
-X = _Signal_SOLTrain.drop(['date', 'time', 'Actual_Y'], axis=1)
-y = _Signal_SOLTrain['Actual_Y']
+def Gen_backtesting_signal_cont(_data:pd.DataFrame):
+    # Signal
+    _signaldf = pd.DataFrame(data=[x for x in _data.date], columns=['date'])
+    _signaldf['time'] = _data.time
+#     # SOS
+#     _signaldf['SOS'] = _data['SOS']
+#     # RSI
+#     _signaldf['RSI'] = _data['RSI']
+#     _signaldf['SRSI'] = _data['SRSI']
+#     # SVOL
+#     _signaldf['SVOL'] = _data['SVOL']
+#     # APO
+#     _signaldf['APO'] = _data['APO']
+#     # MFI
+#     _signaldf['MFI'] = _data['MFI']
+#     # KD
+#     _signaldf['KD'] = _data['SFastK'] - _data['SSlowK']
+#     # ST
+#     _signaldf['SuperTrend'] = _data[['Close', 'ST']].apply(lambda x : -1 if x[0] <= x[1] else 1, axis=1)
+    # Return Lag
+    for _lag in [1, 2, 3, 4, 5, 7, 14, 28]:
+        _signaldf['Return_LAG_{}'.format(_lag)] = _data['Return_LAG_{}'.format(_lag)]
+    # Realized Volatility
+    RV_scaled = pd.DataFrame(preprocessing.StandardScaler().fit_transform(_data[_data.columns[['RealizedVol' \
+                      in col for col in _data.columns]]]), columns=_data[_data.columns[['RealizedVol' in \
+                          col for col in _data.columns]]].columns)
+    # ADTV
+    ADTV_scaled = pd.DataFrame(preprocessing.StandardScaler().fit_transform(_data[_data.columns[['ADTV' \
+                      in col for col in _data.columns]]]), columns=_data[_data.columns[['ADTV' in \
+                          col for col in _data.columns]]].columns)
+    _signaldf = pd.concat([_signaldf, RV_scaled, ADTV_scaled], axis=1)
+#     # EMA Diff
+#     for _ema in [3, 5, 7, 14, 28, 60, 90, 120, 150, 180]:
+#         _signaldf['EMA_{}'.format(_ema)] = _data.Close - _data.Close.ewm(span=_ema).mean()
+#     # MACD Hist
+#     _signaldf['MACD_Hist'] = _data['MACD_Hist']
+    # Y
+    _signaldf['Actual_Y'] = (_data['Close'].shift(-1)/_data['Close']-1).apply(lambda x : 1 if x > 0 else 0)
+    
+    return _signaldf[(_signaldf.date > min(_signaldf.date)) & \
+            (_signaldf.date < max(_signaldf.date))].reset_index(drop=True)
+            
+# data
+_Traindf = Gen_backtesting_signal_cont(_data=_SOLTrain)
+_Testdf = Gen_backtesting_signal_cont(_data=_SOLTest)
 
-cv_params = {'subsample': [0.8,0.9,1], 'max_delta_step': [0,1,2,4]}
-fix_params = {'learning_rate': 0.2, 'n_estimators': 100, 'objective': 'binary:logistic', 'max_depth':6, 'min_child_weight':3, 
-             'max_delta_step': 0, 'subsample':1}
+def vifcl(df):
+    a = 0
+    i = 0
+    vif = pd.DataFrame()
+    vif["VIF Factor"] = [variance_inflation_factor(df.values, i) for i in range(df.shape[1])]
+    vif["features"] = df.columns
+    t = vif["VIF Factor"].max()
+    for each in vif["VIF Factor"]:
+        if each == t and each >= 10:
+            a = i
+        i += 1
+    vax = vif["VIF Factor"].loc[a]
+    print(vif.loc[a],"\n>10")
+    return a,vax
+    
+# Raw train/test for VIF
+_trainX_VIF = _Traindf.drop(['date', 'time', 'Actual_Y'], axis=1)
+_trainy_VIF = _Traindf['Actual_Y']
+# First Fit
+vif = pd.DataFrame()
+vif["VIF Factor"] = [variance_inflation_factor(_trainX_VIF.values, i) for i in range(_trainX_VIF.shape[1])]
+vif["features"] = _trainX_VIF.columns
+vif.round(1)
+# Drop VIF>10
+dropcindex=[]
+while True:
+    vmax = 0
+    dropt = False
+    k,s = vifcl(_trainX_VIF)
+    print(s)
+    if s >= 10:
+        dropt = True
+    if dropt == True:
+        print("dropped",_trainX_VIF.columns[k])
+        dropcindex.append(_trainX_VIF.columns[k])
+        _trainX_VIF = _trainX_VIF.drop([_trainX_VIF.columns[k]],axis=1)
+        vif = vif.drop([k])
+        _trainX_VIF = _trainX_VIF.reset_index(drop=True)
+        vif = vif.reset_index(drop=True)
+    else:
+        break
+        
+print(dropcindex)
 
+# LOGI
+# Post VIF fit
+_trainX = _Traindf.drop(['date', 'time', 'Actual_Y'] + dropcindex, axis=1)
+_trainy = _Traindf['Actual_Y']
+_testX = _Testdf.drop(['date', 'time', 'Actual_Y'] + dropcindex, axis=1)
+_testy = _Testdf['Actual_Y']
+# Constant
+#_trainX = sm.add_constant(_trainX)
+#_testX = sm.add_constant(_testX)
+model = sm.Logit(_trainy, _trainX)
+logi = model.fit(solver='lbfgs', max_iter=1000, C=1e9)
+print('Training Data')
+display(logi.summary())
+display(confusion_matrix(_trainy, (logi.predict(_trainX) >= 0.5).astype(int)))
+print(classification_report(_trainy, (logi.predict(_trainX) >= 0.5).astype(int)))
+print('Testing Data')
+display(confusion_matrix(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
+print(classification_report(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
+
+# Post VIF fit
+_trainX = _Traindf.drop(['date', 'time', 'Actual_Y'] + dropcindex, axis=1)
+_trainy = _Traindf['Actual_Y']
+_testX = _Testdf.drop(['date', 'time', 'Actual_Y'] + dropcindex, axis=1)
+_testy = _Testdf['Actual_Y']
+fix_params = {'objective': 'binary:logistic', 'eval_metric':'mlogloss', \
+              'colsample_bytree': 0.35, 'eta': 0.05, 'max_depth': 5, \
+              'n_estimators': 500, 'subsample': 0.45, 'use_label_encoder':False}
 xg_reg = xgb.XGBClassifier(**fix_params)
-csv = GridSearchCV(xgb.XGBClassifier(**fix_params), cv_params, scoring = 'f1', cv = 5)
-csv.fit(X, y)
-csv.best_params_
+xg_reg.fit(_trainX, _trainy)
+print('Training Data')
+display(confusion_matrix(_trainy, xg_reg.predict(_trainX)))
+print(classification_report(_trainy, xg_reg.predict(_trainX)))
+fig, ax = plt.subplots(figsize=(10,10))
+xgb.plot_importance(xg_reg, max_num_features=10, height=0.5, ax=ax,importance_type='weight')
+plt.show()
+print('Testing Data')
+display(confusion_matrix(_testy, xg_reg.predict(_testX)))
+print(classification_report(_testy, xg_reg.predict(_testX)))
