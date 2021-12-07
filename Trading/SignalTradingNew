@@ -1,0 +1,194 @@
+import pandas as pd
+import numpy as np
+import random
+import datetime
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+import xgboost as xgb
+from sklearn import preprocessing
+from sklearn.linear_model import LogisticRegression
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from sklearn.metrics import classification_report, confusion_matrix
+
+def formatBacktestdata(_ccy:str):
+    # Formatting
+    _tarCol = ['Open time', 'Open', 'High', 'Low', 'Volume', 'Close']
+    _Dir = "C:\\Users\\scchanan\\Cryto\\Data\\"
+    _filename = '{}USDT.csv'.format(_ccy)
+    _histData = pd.read_csv(_Dir + _filename, dtype={'Open time':str})[_tarCol].dropna()
+    _histData['datetime'] = pd.to_datetime(_histData['Open time'], format='%Y-%m-%d %H:%M:%S')
+    _histData = _histData.sort_values('datetime').reset_index(drop=True)
+    _histData['date'] = _histData.datetime.dt.date
+    _histData['time'] = _histData.datetime.dt.time
+    _histData['symbol'] = _ccy + '/' + 'USDT'
+    _histData = _histData[['datetime', 'date', 'time', 'symbol'] + _tarCol]
+    _histData = _histData.drop(columns=['Open time'], axis=1)
+    return _histData
+    
+def getRandomPeriod(_date:list, _numDays:int):
+    _minDate = datetime.date(2020, 12, 31)
+    _maxDate = datetime.date(2021, 10, 31)
+    _startPeriod = random.choice(_date)
+    _endPeriod = _startPeriod + datetime.timedelta(days=_numDays)
+    if (_startPeriod >= _minDate) and (_endPeriod <= _maxDate) :
+        return _startPeriod, _endPeriod
+    else:
+        return getRandomPeriod(_date, _numDays)
+        
+def Gen_Y(_close:pd.Series, _numPeriod:int):
+    _execCost = 0.0005
+    _Fore = pd.DataFrame(_close, columns=['Close'])
+    _outY = []
+    for i in range(1, _numPeriod+1):
+        _Fore['Fwd_{}'.format(i)] = (((_Fore['Close'].shift(-i)/_Fore['Close'])-1))
+    _Y = (_Fore.drop(['Close'], axis=1) > _execCost).sum(axis=1).apply(lambda x: 1 if x > 0 else 0)
+    return _Y
+    
+def Gen_backtesting_data(_ccy:str):
+    # Load data
+    _data = formatBacktestdata(_ccy)
+    #_startDate, _endDate = getRandomPeriod(_date=_data.date.unique(), _numDays=90)
+    _TrainStartDate, _TrainEndDate = datetime.date(2020, 12, 31), datetime.date(2021, 10, 31) 
+    _TestStartDate, _TestEndDate = datetime.date(2021, 10, 31), datetime.date(2021, 12, 1) 
+    _train = _data[(_data.date >= _TrainStartDate) & (_data.date <= _TrainEndDate)].reset_index(drop=True)
+    _test = _data[(_data.date >= _TestStartDate) & (_data.date <= _TestEndDate)].reset_index(drop=True)
+    for data in [_train, _test]:
+        # Normalization
+        # Return Lag
+        for _lag in [1, 2, 3, 4, 5, 7, 14, 28]:
+            data['Return_LAG_{}'.format(_lag)] = (data.Close/data.Close.shift(_lag)-1)
+        # Realized Volatility
+        for _rv in [15, 30, 60, 180, 360, 720, 1440]:
+            ann_factor = 1440 * 365 / _rv
+            data['RealizedVol_Window_{}'.format(_rv)] = np.sqrt(np.square(data.Return_LAG_1).rolling(_rv).sum().clip(0,None) \
+                *ann_factor)
+        # ADTV
+        for _adtv in [3, 5, 15, 30, 60, 180, 360, 1440]:
+            data['ADTV_{}'.format(_adtv)] = data.Volume.rolling(window=_adtv).mean().shift(1)
+        # Y
+        _execCost = 0.0005
+        data['Actual_Y'] = Gen_Y(_close=_data.Close, _numPeriod=3)
+    # Cut First and Last Day
+    _train = _train[(_train.date > _TrainStartDate) & (_train.date < _TrainEndDate)].reset_index(drop=True)
+    _test = _test[(_test.date > _TestStartDate) & (_test.date < _TestEndDate)].reset_index(drop=True)
+    return _train, _test
+    
+def Gen_backtesting_signal_cont(_data:pd.DataFrame):
+    # Signal
+    _signaldf = pd.DataFrame(data=[x for x in _data.date], columns=['date'])
+    _signaldf['time'] = _data.time
+    # Return Lag
+    for _lag in [1, 2, 3, 4, 5, 7, 14, 28]:
+        _signaldf['Return_LAG_{}'.format(_lag)] = _data['Return_LAG_{}'.format(_lag)]
+    # Realized Volatility
+    RV_scaled = pd.DataFrame(preprocessing.StandardScaler().fit_transform(_data[_data.columns[['RealizedVol' \
+                      in col for col in _data.columns]]]), columns=_data[_data.columns[['RealizedVol' in \
+                          col for col in _data.columns]]].columns)
+    # ADTV
+    ADTV_scaled = pd.DataFrame(preprocessing.StandardScaler().fit_transform(_data[_data.columns[['ADTV' \
+                      in col for col in _data.columns]]]), columns=_data[_data.columns[['ADTV' in \
+                          col for col in _data.columns]]].columns)
+    _signaldf = pd.concat([_signaldf, RV_scaled, ADTV_scaled], axis=1)
+    # Y
+    _signaldf['Actual_Y'] = _data['Actual_Y']
+    
+    return _signaldf
+    
+def vifcl(df:pd.DataFrame):
+    a = 0
+    i = 0
+    vif = pd.DataFrame()
+    vif["VIF Factor"] = [variance_inflation_factor(df.values, i) for i in range(df.shape[1])]
+    vif["features"] = df.columns
+    t = vif["VIF Factor"].max()
+    for each in vif["VIF Factor"]:
+        if each == t and each >= 10:
+            a = i
+        i += 1
+    vax = vif["VIF Factor"].loc[a]
+    print(vif.loc[a],"\n>10")
+    return a,vax
+    
+def runVIF(df:pd.DataFrame):
+    # Raw train/test for VIF
+    _VIF_X = df.drop(['date', 'time', 'Actual_Y'], axis=1)
+    _VIF_y = df['Actual_Y']
+    # First Fit
+    vif = pd.DataFrame()
+    vif["VIF Factor"] = [variance_inflation_factor(_VIF_X.values, i) for i in range(_VIF_X.shape[1])]
+    vif["features"] = _VIF_X.columns
+    vif.round(1)
+    # Drop VIF>10
+    dropcindex=[]
+    while True:
+        vmax = 0
+        dropt = False
+        k,s = vifcl(_VIF_X)
+        if s >= 10:
+            dropt = True
+        if dropt == True:
+            print("dropped",_VIF_X.columns[k])
+            dropcindex.append(_VIF_X.columns[k])
+            _VIF_X = _VIF_X.drop([_VIF_X.columns[k]],axis=1)
+            vif = vif.drop([k])
+            _VIF_X = _VIF_X.reset_index(drop=True)
+            vif = vif.reset_index(drop=True)
+        else:
+            break
+    return dropcindex
+    
+_dataDict = {}
+_ccyList = ['BTC']#, 'ETH', 'SOL']
+for _ccy in _ccyList:
+    _dataDict[_ccy] = {}
+    _dataDict[_ccy]['Train'], _dataDict[_ccy]['Test'] = Gen_backtesting_data(_ccy)
+    # Normalization
+    _dataDict[_ccy]['NormalizedTrain'], _dataDict[_ccy]['NormalizedTest'] = \
+        Gen_backtesting_signal_cont(_data=_dataDict[_ccy]['Train']), Gen_backtesting_signal_cont(_data=_dataDict[_ccy]['Test'])
+    # VIF
+    _dataDict[_ccy]['VIFExcluded'] = runVIF(_dataDict[_ccy]['NormalizedTrain'])
+    _dataDict[_ccy]['VIFIncluded'] = _dataDict[_ccy]['NormalizedTrain'].columns \
+        [~_dataDict[_ccy]['NormalizedTrain'].columns.isin(_dataDict[_ccy]['VIFExcluded'])]
+    _dataDict[_ccy]['NVIFTrain'] = _dataDict[_ccy]['NormalizedTrain'][_dataDict[_ccy]['VIFIncluded']]
+    _dataDict[_ccy]['NVIFTest'] = _dataDict[_ccy]['NormalizedTest'][_dataDict[_ccy]['VIFIncluded']]
+    
+# LOGI
+# Post VIF fit
+_tarCcy = 'BTC'
+_trainX = _dataDict[_tarCcy]['NVIFTrain'].drop(['date', 'time', 'Actual_Y'], axis=1)
+_trainy = _dataDict[_tarCcy]['NVIFTrain']['Actual_Y']
+_testX = _dataDict[_tarCcy]['NVIFTest'].drop(['date', 'time', 'Actual_Y'], axis=1)
+_testy = _dataDict[_tarCcy]['NVIFTest']['Actual_Y']
+# Constant
+#_trainX = sm.add_constant(_trainX)
+#_testX = sm.add_constant(_testX)
+model = sm.Logit(_trainy, _trainX)
+logi = model.fit(solver='lbfgs', max_iter=1000, C=1e9)
+print('Training Data')
+display(logi.summary())
+display(confusion_matrix(_trainy, (logi.predict(_trainX) >= 0.5).astype(int)))
+print(classification_report(_trainy, (logi.predict(_trainX) >= 0.5).astype(int)))
+print('Testing Data')
+display(confusion_matrix(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
+print(classification_report(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
+
+# XGBoost
+# Post VIF fit
+_trainX = _dataDict[_tarCcy]['NVIFTrain'].drop(['date', 'time', 'Actual_Y'], axis=1)
+_trainy = _dataDict[_tarCcy]['NVIFTrain']['Actual_Y']
+_testX = _dataDict[_tarCcy]['NVIFTest'].drop(['date', 'time', 'Actual_Y'], axis=1)
+_testy = _dataDict[_tarCcy]['NVIFTest']['Actual_Y']
+fix_params = {'objective': 'binary:logistic', 'eval_metric':'mlogloss', \
+              'colsample_bytree': 0.35, 'eta': 0.05, 'max_depth': 5, \
+              'n_estimators': 100, 'subsample': 0.45, 'use_label_encoder':False}
+xg_reg = xgb.XGBClassifier(**fix_params)
+xg_reg.fit(_trainX, _trainy)
+print('Training Data')
+display(confusion_matrix(_trainy, xg_reg.predict(_trainX)))
+print(classification_report(_trainy, xg_reg.predict(_trainX)))
+fig, ax = plt.subplots(figsize=(10,10))
+xgb.plot_importance(xg_reg, max_num_features=10, height=0.5, ax=ax,importance_type='weight')
+plt.show()
+print('Testing Data')
+display(confusion_matrix(_testy, xg_reg.predict(_testX)))
+print(classification_report(_testy, xg_reg.predict(_testX)))
