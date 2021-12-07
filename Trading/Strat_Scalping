@@ -4,6 +4,7 @@ import random
 import datetime
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
+from tqdm import tqdm
 import xgboost as xgb
 from sklearn import preprocessing
 from sklearn.linear_model import LogisticRegression
@@ -13,7 +14,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 def formatBacktestdata(_ccy:str):
     # Formatting
     _tarCol = ['Open time', 'Open', 'High', 'Low', 'Volume', 'Close']
-    _Dir = "C:\\Users\\scchanan\\Cryto\\Data\\"
+    _Dir = "C:\\Users\\LCYY\\Desktop\\CrytoTrade\\Data\\Binance\\"
     _filename = '{}USDT.csv'.format(_ccy)
     _histData = pd.read_csv(_Dir + _filename, dtype={'Open time':str})[_tarCol].dropna()
     _histData['datetime'] = pd.to_datetime(_histData['Open time'], format='%Y-%m-%d %H:%M:%S')
@@ -36,7 +37,8 @@ def getRandomPeriod(_date:list, _numDays:int):
         return getRandomPeriod(_date, _numDays)
         
 def Gen_Y(_close:pd.Series, _numPeriod:int):
-    _execCost = 0.0005
+    _closelag = (_close.shift(1)/_close)-1
+    _execCost = abs(_closelag[_closelag < 0].mean()) * 0.5
     _Fore = pd.DataFrame(_close, columns=['Close'])
     _outY = []
     for i in range(1, _numPeriod+1):
@@ -44,7 +46,7 @@ def Gen_Y(_close:pd.Series, _numPeriod:int):
     _Y = (_Fore.drop(['Close'], axis=1) > _execCost).sum(axis=1).apply(lambda x: 1 if x > 0 else 0)
     return _Y
     
-def Gen_backtesting_data(_ccy:str):
+def Gen_backtesting_data(_ccy:str, _scalpWindow:int):
     # Load data
     _data = formatBacktestdata(_ccy)
     #_startDate, _endDate = getRandomPeriod(_date=_data.date.unique(), _numDays=90)
@@ -67,7 +69,7 @@ def Gen_backtesting_data(_ccy:str):
             data['ADTV_{}'.format(_adtv)] = data.Volume.rolling(window=_adtv).mean().shift(1)
         # Y
         _execCost = 0.0005
-        data['Actual_Y'] = Gen_Y(_close=_data.Close, _numPeriod=3)
+        data['Actual_Y'] = Gen_Y(_close=_data.Close, _numPeriod=_scalpWindow)
     # Cut First and Last Day
     _train = _train[(_train.date > _TrainStartDate) & (_train.date < _TrainEndDate)].reset_index(drop=True)
     _test = _test[(_test.date > _TestStartDate) & (_test.date < _TestEndDate)].reset_index(drop=True)
@@ -93,7 +95,18 @@ def Gen_backtesting_signal_cont(_data:pd.DataFrame):
     _signaldf['Actual_Y'] = _data['Actual_Y']
     
     return _signaldf
-    
+
+def GetSellingPrice(_buysignal:int, _buyPx:float, _close1:float, _close2:float, _close3:float):
+    if _buysignal == 1:
+        if _close1 > _buyPx:
+            return _close1
+        elif _close2 > _buyPx:
+            return _close2
+        else:
+            return _close3
+    else:
+        return 0
+        
 def vifcl(df:pd.DataFrame):
     a = 0
     i = 0
@@ -106,7 +119,7 @@ def vifcl(df:pd.DataFrame):
             a = i
         i += 1
     vax = vif["VIF Factor"].loc[a]
-    print(vif.loc[a],"\n>10")
+    #print(vif.loc[a],"\n>10")
     return a,vax
     
 def runVIF(df:pd.DataFrame):
@@ -127,7 +140,7 @@ def runVIF(df:pd.DataFrame):
         if s >= 10:
             dropt = True
         if dropt == True:
-            print("dropped",_VIF_X.columns[k])
+            #print("dropped",_VIF_X.columns[k])
             dropcindex.append(_VIF_X.columns[k])
             _VIF_X = _VIF_X.drop([_VIF_X.columns[k]],axis=1)
             vif = vif.drop([k])
@@ -137,11 +150,14 @@ def runVIF(df:pd.DataFrame):
             break
     return dropcindex
     
+# Param
 _dataDict = {}
-_ccyList = ['BTC']#, 'ETH', 'SOL']
-for _ccy in _ccyList:
+_scalpingWindow = 3
+_ccyList = ['BTC', 'ETH', 'SOL']
+# Backtesting
+for _ccy in tqdm(_ccyList):
     _dataDict[_ccy] = {}
-    _dataDict[_ccy]['Train'], _dataDict[_ccy]['Test'] = Gen_backtesting_data(_ccy)
+    _dataDict[_ccy]['Train'], _dataDict[_ccy]['Test'] = Gen_backtesting_data(_ccy=_ccy, _scalpWindow=_scalpingWindow)
     # Normalization
     _dataDict[_ccy]['NormalizedTrain'], _dataDict[_ccy]['NormalizedTest'] = \
         Gen_backtesting_signal_cont(_data=_dataDict[_ccy]['Train']), Gen_backtesting_signal_cont(_data=_dataDict[_ccy]['Test'])
@@ -192,3 +208,25 @@ plt.show()
 print('Testing Data')
 display(confusion_matrix(_testy, xg_reg.predict(_testX)))
 print(classification_report(_testy, xg_reg.predict(_testX)))
+
+# PnL
+_initialNotional = 100000
+_executionCost = 0.005
+_predicted = pd.Series(xg_reg.predict(_testX), name='Buy_Signal')
+_close = formatBacktestdata(_tarCcy)[(_data.date >= datetime.date(2021, 11, 1)) & \
+            (_data.date <= datetime.date(2021, 12, 1))].reset_index(drop=True).Close
+Plotdf = pd.concat([_dataDict[_tarCcy]['Test'].date, _dataDict[_tarCcy]['Test'].time, \
+                    _dataDict[_tarCcy]['Test']['Close'], _predicted, _dataDict[_tarCcy]['Test']['Actual_Y']], axis=1)
+# Buy Price
+Plotdf['BuyPx'] = Plotdf.Close * Plotdf.Buy_Signal
+for i in range(1, _scalpingWindow+1):
+    Plotdf['Close_t+{}'.format(i)] = _close.shift(-i)[:len(Plotdf)]
+# Selling Price
+Plotdf['SellPx'] = Plotdf[['Buy_Signal', 'BuyPx', 'Close_t+1', 'Close_t+2', 'Close_t+3']].apply(lambda x: 
+                        GetSellingPrice(_buysignal=x[0], _buyPx=x[1], _close1=x[2], _close2=x[3], _close3=x[4]), axis=1)
+# Return
+Plotdf['Implied Return (%)'] = (Plotdf['SellPx']/Plotdf['BuyPx']-1).fillna(0) * 100
+Plotdf['MTM PnL (USD)'] = Plotdf['Implied Return (%)']/100 * _initialNotional
+Plotdf['Realized PnL (USD)'] = Plotdf['Buy_Signal'] * (Plotdf['MTM PnL (USD)'] - abs(Plotdf['MTM PnL (USD)'] * _executionCost))
+Plotdf['Realized Return (%)'] = Plotdf['Realized PnL (USD)']/_initialNotional * 100
+Plotdf['CumReturn'] = (Plotdf['Realized Return (%)']/100+1).cumprod()-1
