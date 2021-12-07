@@ -11,6 +11,8 @@ from sklearn.linear_model import LogisticRegression
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.metrics import classification_report, confusion_matrix
 
+https://drive.google.com/drive/folders/1WxtDzv46-dfg6OS3GmUBXoV34FyaGvCL
+
 def formatBacktestdata(_ccy:str):
     # Formatting
     _tarCol = ['Open time', 'Open', 'High', 'Low', 'Volume', 'Close']
