@@ -38,12 +38,12 @@ def getRandomPeriod(_date:list, _numDays:int):
         
 def Gen_Y(_close:pd.Series, _numPeriod:int):
     _closelag = (_close.shift(1)/_close)-1
-    _execCost = abs(_closelag[_closelag < 0].mean()) * 0.5
+    _tarRtn = abs(_closelag[_closelag < 0].mean()) * 0.5
     _Fore = pd.DataFrame(_close, columns=['Close'])
     _outY = []
     for i in range(1, _numPeriod+1):
         _Fore['Fwd_{}'.format(i)] = (((_Fore['Close'].shift(-i)/_Fore['Close'])-1))
-    _Y = (_Fore.drop(['Close'], axis=1) > _execCost).sum(axis=1).apply(lambda x: 1 if x > 0 else 0)
+    _Y = (_Fore.drop(['Close'], axis=1) > _tarRtn).sum(axis=1).apply(lambda x: 1 if x > 0 else 0)
     return _Y
     
 def Gen_backtesting_data(_ccy:str, _scalpWindow:int):
@@ -60,13 +60,13 @@ def Gen_backtesting_data(_ccy:str, _scalpWindow:int):
         for _lag in [1, 2, 3, 4, 5, 7, 14, 28]:
             data['Return_LAG_{}'.format(_lag)] = (data.Close/data.Close.shift(_lag)-1)
         # Realized Volatility
-        for _rv in [15, 30, 60, 180, 360, 720, 1440]:
+        for _rv in [5, 15, 30, 60, 180, 360, 720, 1440]: #[5, 30, 360, 1440]
             ann_factor = 1440 * 365 / _rv
             data['RealizedVol_Window_{}'.format(_rv)] = np.sqrt(np.square(data.Return_LAG_1).rolling(_rv).sum().clip(0,None) \
                 *ann_factor)
         # ADTV
-        for _adtv in [3, 5, 15, 30, 60, 180, 360, 1440]:
-            data['ADTV_{}'.format(_adtv)] = data.Volume.rolling(window=_adtv).mean().shift(1)
+        for _adtv in [3, 5, 15, 30, 60, 180, 360, 720, 1440]: #[3, 15, 60, 180, 720]
+            data['AvgVolume_Period_{}'.format(_adtv)] = data.Volume.rolling(window=_adtv).mean().shift(1)
         # Y
         _execCost = 0.0005
         data['Actual_Y'] = Gen_Y(_close=_data.Close, _numPeriod=_scalpWindow)
@@ -75,7 +75,7 @@ def Gen_backtesting_data(_ccy:str, _scalpWindow:int):
     _test = _test[(_test.date > _TestStartDate) & (_test.date < _TestEndDate)].reset_index(drop=True)
     return _train, _test
     
-def Gen_backtesting_signal_cont(_data:pd.DataFrame):
+def Gen_backtesting_Normalization(_data:pd.DataFrame):
     # Signal
     _signaldf = pd.DataFrame(data=[x for x in _data.date], columns=['date'])
     _signaldf['time'] = _data.time
@@ -87,8 +87,8 @@ def Gen_backtesting_signal_cont(_data:pd.DataFrame):
                       in col for col in _data.columns]]]), columns=_data[_data.columns[['RealizedVol' in \
                           col for col in _data.columns]]].columns)
     # ADTV
-    ADTV_scaled = pd.DataFrame(preprocessing.StandardScaler().fit_transform(_data[_data.columns[['ADTV' \
-                      in col for col in _data.columns]]]), columns=_data[_data.columns[['ADTV' in \
+    ADTV_scaled = pd.DataFrame(preprocessing.StandardScaler().fit_transform(_data[_data.columns[['AvgVolume' \
+                      in col for col in _data.columns]]]), columns=_data[_data.columns[['AvgVolume' in \
                           col for col in _data.columns]]].columns)
     _signaldf = pd.concat([_signaldf, RV_scaled, ADTV_scaled], axis=1)
     # Y
@@ -106,7 +106,34 @@ def GetSellingPrice(_buysignal:int, _buyPx:float, _close1:float, _close2:float, 
             return _close3
     else:
         return 0
-        
+    
+def Gen_PnLAnalysis(_model:str, _tarCcy:str, _initialNotional:float, _executionCost:float):
+    # PnL
+    _predicted = pd.Series(_dataDict[_tarCcy][_model].predict(_dataDict[_tarCcy]['TestX']), name='Buy_Signal')
+    _tardata = formatBacktestdata(_tarCcy)
+    _close = _tardata[(_tardata.date >= datetime.date(2021, 11, 1)) & \
+                (_tardata.date <= datetime.date(2021, 12, 1))].reset_index(drop=True).Close
+    Plotdf = pd.concat([_dataDict[_tarCcy]['Test'].date, _dataDict[_tarCcy]['Test'].time, \
+                        _dataDict[_tarCcy]['Test']['Close'], _predicted, _dataDict[_tarCcy]['Test']['Actual_Y']], axis=1)
+    # Buy Price
+    Plotdf['BuyPx'] = Plotdf.Close * Plotdf.Buy_Signal
+    for i in range(1, _scalpingWindow+1):
+        Plotdf['Close_t+{}'.format(i)] = _close.shift(-i)[:len(Plotdf)]
+    # Selling Price
+    Plotdf['SellPx'] = Plotdf[['Buy_Signal', 'BuyPx', 'Close_t+1', 'Close_t+2', 'Close_t+3']].apply(lambda x: 
+                            GetSellingPrice(_buysignal=x[0], _buyPx=x[1], _close1=x[2], _close2=x[3], _close3=x[4]), axis=1)
+    # Return
+    Plotdf['Implied Return (%)'] = (Plotdf['SellPx']/Plotdf['BuyPx']-1).fillna(0) * 100
+    Plotdf['MTM PnL (USD)'] = Plotdf['Implied Return (%)']/100 * _initialNotional
+    Plotdf['Realized PnL (USD)'] = Plotdf['Buy_Signal'] * (Plotdf['MTM PnL (USD)'] - abs(Plotdf['MTM PnL (USD)'] * _executionCost))
+    Plotdf['Realized Return (%)'] = Plotdf['Realized PnL (USD)']/_initialNotional * 100
+    Plotdf['Cumulative Return (%)'] = ((Plotdf['Realized Return (%)']/100+1).cumprod()-1) * 100
+    Plotdf['Realized Vol (360 Period)'] = _dataDict[_tarCcy]['Test']['RealizedVol_Window_360']
+    Plotdf['Risk-Adjusted Realized Return (%)'] = Plotdf['Realized Return (%)'] / Plotdf['Realized Vol (360 Period)']
+    Plotdf['Risk-Adjusted Cumulative Return (%)'] = ((Plotdf['Risk-Adjusted Realized Return (%)']/100+1).cumprod()-1) * 100
+    Plotdf.index = _dataDict[_tarCcy]['Test']['datetime']
+    return Plotdf
+    
 def vifcl(df:pd.DataFrame):
     a = 0
     i = 0
@@ -153,80 +180,131 @@ def runVIF(df:pd.DataFrame):
 # Param
 _dataDict = {}
 _scalpingWindow = 3
-_ccyList = ['BTC', 'ETH', 'SOL']
+_ccyList = ['ADA','BNB','BTC','ETH','SOL','SAND']
 # Backtesting
 for _ccy in tqdm(_ccyList):
     _dataDict[_ccy] = {}
     _dataDict[_ccy]['Train'], _dataDict[_ccy]['Test'] = Gen_backtesting_data(_ccy=_ccy, _scalpWindow=_scalpingWindow)
     # Normalization
     _dataDict[_ccy]['NormalizedTrain'], _dataDict[_ccy]['NormalizedTest'] = \
-        Gen_backtesting_signal_cont(_data=_dataDict[_ccy]['Train']), Gen_backtesting_signal_cont(_data=_dataDict[_ccy]['Test'])
+        Gen_backtesting_Normalization(_data=_dataDict[_ccy]['Train']), \
+            Gen_backtesting_Normalization(_data=_dataDict[_ccy]['Test'])
     # VIF
     _dataDict[_ccy]['VIFExcluded'] = runVIF(_dataDict[_ccy]['NormalizedTrain'])
     _dataDict[_ccy]['VIFIncluded'] = _dataDict[_ccy]['NormalizedTrain'].columns \
         [~_dataDict[_ccy]['NormalizedTrain'].columns.isin(_dataDict[_ccy]['VIFExcluded'])]
     _dataDict[_ccy]['NVIFTrain'] = _dataDict[_ccy]['NormalizedTrain'][_dataDict[_ccy]['VIFIncluded']]
     _dataDict[_ccy]['NVIFTest'] = _dataDict[_ccy]['NormalizedTest'][_dataDict[_ccy]['VIFIncluded']]
-    
+    # Model Fitting
+    _dataDict[_ccy]['TrainX'] = _dataDict[_ccy]['NVIFTrain'].drop(['date', 'time', 'Actual_Y'], axis=1)
+    _dataDict[_ccy]['TestX'] = _dataDict[_ccy]['NVIFTest'].drop(['date', 'time', 'Actual_Y'], axis=1)
+    _dataDict[_ccy]['TrainY'] = _dataDict[_ccy]['NVIFTrain']['Actual_Y']
+    _dataDict[_ccy]['TestY'] = _dataDict[_ccy]['NVIFTest']['Actual_Y']
+    # LOGI
+    _dataDict[_ccy]['Model_LOGI'] = sm.Logit(_dataDict[_ccy]['TrainY'], _dataDict[_ccy]['TrainX']) \
+        .fit(solver='lbfgs', max_iter=1000, C=1e9, disp=0)
+    # XGBOOST
+    _XGBoostParams = {'objective': 'binary:logistic', 'eval_metric':'mlogloss', 'colsample_bytree': 0.35, \
+                          'eta': 0.05, 'max_depth': 5, 'n_estimators': 100, 'subsample': 0.45, 'use_label_encoder':False}
+    _dataDict[_ccy]['Model_XGBoost'] = xgb.XGBClassifier(**_XGBoostParams).fit(_dataDict[_ccy]['TrainX'], \
+        _dataDict[_ccy]['TrainY'])
+    # PnL Analysis
+    _dataDict[_ccy]['PnL_Analysis'] = Gen_PnLAnalysis(_model='Model_XGBoost', _tarCcy=_ccy, \
+        _initialNotional=100000, _executionCost=0.005)
+        
+_maxVIF = max([len(_dataDict[_ccy]['VIFExcluded']) for _ccy in _ccyList])
+_VIFExclude = pd.DataFrame(index=['VIF_Feature_Excluded_{}'.format(numVIF+1) for numVIF in range(_maxVIF)], columns=_ccyList)
+for _ccy in _ccyList:
+    if len(_dataDict[_ccy]['VIFExcluded']) < _maxVIF:
+        _VIFExclude[_ccy] = _dataDict[_ccy]['VIFExcluded'] + [np.nan]*(_maxVIF - len(_dataDict[_ccy]['VIFExcluded']))
+    else:
+        _VIFExclude[_ccy] = _dataDict[_ccy]['VIFExcluded']
+display(pd.DataFrame(_VIFExclude.stack().value_counts(), columns=['Count']))
+
+_tarCcy = 'ADA'
+_ccyData = _dataDict[_tarCcy]
+
 # LOGI
-# Post VIF fit
-_tarCcy = 'BTC'
-_trainX = _dataDict[_tarCcy]['NVIFTrain'].drop(['date', 'time', 'Actual_Y'], axis=1)
-_trainy = _dataDict[_tarCcy]['NVIFTrain']['Actual_Y']
-_testX = _dataDict[_tarCcy]['NVIFTest'].drop(['date', 'time', 'Actual_Y'], axis=1)
-_testy = _dataDict[_tarCcy]['NVIFTest']['Actual_Y']
-# Constant
-#_trainX = sm.add_constant(_trainX)
-#_testX = sm.add_constant(_testX)
-model = sm.Logit(_trainy, _trainX)
-logi = model.fit(solver='lbfgs', max_iter=1000, C=1e9)
 print('Training Data')
-display(logi.summary())
-display(confusion_matrix(_trainy, (logi.predict(_trainX) >= 0.5).astype(int)))
-print(classification_report(_trainy, (logi.predict(_trainX) >= 0.5).astype(int)))
+# Logi-Summary
+display(_ccyData['Model_LOGI'].summary())
+# Confusion Matrix and Classification Report
+display(confusion_matrix(_ccyData['TrainY'], (_ccyData['Model_LOGI'].predict(_ccyData['TrainX']) >= 0.5).astype(int)))
+print(classification_report(_ccyData['TrainY'], (_ccyData['Model_LOGI'].predict(_ccyData['TrainX']) >= 0.5).astype(int)))
 print('Testing Data')
-display(confusion_matrix(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
-print(classification_report(_testy, (logi.predict(_testX) >= 0.5).astype(int)))
+display(confusion_matrix(_ccyData['TestY'], (_ccyData['Model_LOGI'].predict(_ccyData['TestX']) >= 0.5).astype(int)))
+print(classification_report(_ccyData['TestY'], (_ccyData['Model_LOGI'].predict(_ccyData['TestX']) >= 0.5).astype(int)))
 
 # XGBoost
-# Post VIF fit
-_trainX = _dataDict[_tarCcy]['NVIFTrain'].drop(['date', 'time', 'Actual_Y'], axis=1)
-_trainy = _dataDict[_tarCcy]['NVIFTrain']['Actual_Y']
-_testX = _dataDict[_tarCcy]['NVIFTest'].drop(['date', 'time', 'Actual_Y'], axis=1)
-_testy = _dataDict[_tarCcy]['NVIFTest']['Actual_Y']
-fix_params = {'objective': 'binary:logistic', 'eval_metric':'mlogloss', \
-              'colsample_bytree': 0.35, 'eta': 0.05, 'max_depth': 5, \
-              'n_estimators': 100, 'subsample': 0.45, 'use_label_encoder':False}
-xg_reg = xgb.XGBClassifier(**fix_params)
-xg_reg.fit(_trainX, _trainy)
 print('Training Data')
-display(confusion_matrix(_trainy, xg_reg.predict(_trainX)))
-print(classification_report(_trainy, xg_reg.predict(_trainX)))
+# Signifiance
 fig, ax = plt.subplots(figsize=(10,10))
-xgb.plot_importance(xg_reg, max_num_features=10, height=0.5, ax=ax,importance_type='weight')
+xgb.plot_importance(_ccyData['Model_XGBoost'], height=0.5, ax=ax,importance_type='gain')
 plt.show()
+# Confusion Matrix and Classification Report
+display(confusion_matrix(_ccyData['TrainY'], (_ccyData['Model_XGBoost'].predict(_ccyData['TrainX']) >= 0.5).astype(int)))
+print(classification_report(_ccyData['TrainY'], (_ccyData['Model_XGBoost'].predict(_ccyData['TrainX']) >= 0.5).astype(int)))
 print('Testing Data')
-display(confusion_matrix(_testy, xg_reg.predict(_testX)))
-print(classification_report(_testy, xg_reg.predict(_testX)))
+display(confusion_matrix(_ccyData['TestY'], (_ccyData['Model_XGBoost'].predict(_ccyData['TestX']) >= 0.5).astype(int)))
+print(classification_report(_ccyData['TestY'], (_ccyData['Model_XGBoost'].predict(_ccyData['TestX']) >= 0.5).astype(int)))
 
-# PnL
-_initialNotional = 100000
-_executionCost = 0.005
-_predicted = pd.Series(xg_reg.predict(_testX), name='Buy_Signal')
-_close = formatBacktestdata(_tarCcy)[(_data.date >= datetime.date(2021, 11, 1)) & \
-            (_data.date <= datetime.date(2021, 12, 1))].reset_index(drop=True).Close
-Plotdf = pd.concat([_dataDict[_tarCcy]['Test'].date, _dataDict[_tarCcy]['Test'].time, \
-                    _dataDict[_tarCcy]['Test']['Close'], _predicted, _dataDict[_tarCcy]['Test']['Actual_Y']], axis=1)
-# Buy Price
-Plotdf['BuyPx'] = Plotdf.Close * Plotdf.Buy_Signal
-for i in range(1, _scalpingWindow+1):
-    Plotdf['Close_t+{}'.format(i)] = _close.shift(-i)[:len(Plotdf)]
-# Selling Price
-Plotdf['SellPx'] = Plotdf[['Buy_Signal', 'BuyPx', 'Close_t+1', 'Close_t+2', 'Close_t+3']].apply(lambda x: 
-                        GetSellingPrice(_buysignal=x[0], _buyPx=x[1], _close1=x[2], _close2=x[3], _close3=x[4]), axis=1)
-# Return
-Plotdf['Implied Return (%)'] = (Plotdf['SellPx']/Plotdf['BuyPx']-1).fillna(0) * 100
-Plotdf['MTM PnL (USD)'] = Plotdf['Implied Return (%)']/100 * _initialNotional
-Plotdf['Realized PnL (USD)'] = Plotdf['Buy_Signal'] * (Plotdf['MTM PnL (USD)'] - abs(Plotdf['MTM PnL (USD)'] * _executionCost))
-Plotdf['Realized Return (%)'] = Plotdf['Realized PnL (USD)']/_initialNotional * 100
-Plotdf['CumReturn'] = (Plotdf['Realized Return (%)']/100+1).cumprod()-1
+# Features Significance
+color = plt.cm.rainbow(np.linspace(0, 1, len(_ccyList)))
+_featuresSigni = pd.DataFrame(index=_dataDict[_ccyList[0]]['NormalizedTrain'].columns[~pd.Series( \
+    _dataDict[_ccyList[0]]['NormalizedTrain'].columns).isin(['date', 'time', 'Actual_Y'])])
+fig, ax = plt.subplots(figsize=(18, 5))
+for _ccy in _ccyList:
+    _featuresSigni[_ccy] = _featuresSigni.index.map(_dataDict[_ccy]['Model_XGBoost'].get_booster() \
+        .get_score(importance_type='gain')).fillna(0)
+_featuresSigni['Total'] = _featuresSigni.sum(axis=1)
+_featuresSigni = _featuresSigni.sort_values(by=['Total'], ascending=False)
+for _ccy in _ccyList:
+    if _ccyList.index(_ccy) == 0:
+        ax.bar(_featuresSigni.index, _featuresSigni[_ccy], 0.35, label=_ccy, color=color[_ccyList.index(_ccy)])
+    else:
+        ax.bar(_featuresSigni.index, _featuresSigni[_ccy], 0.35, \
+               bottom=_featuresSigni.iloc[:, :_ccyList.index(_ccy)].sum(axis=1), label=_ccy, 
+                   color=color[_ccyList.index(_ccy)])
+plt.xlabel('Features')
+plt.ylabel('XGBoost Gain') 
+plt.xticks(rotation=90)
+plt.legend()
+
+# Cumulative Return (%) for each ccy
+fig, ax1 = plt.subplots(figsize=(18, 5))
+color = plt.cm.rainbow(np.linspace(0, 1, len(_ccyList)))
+for _ccy in _ccyList:
+    ax1.plot(_dataDict[_ccy]['PnL_Analysis'].index, _dataDict[_ccy]['PnL_Analysis']['Cumulative Return (%)'], 
+             color=color[_ccyList.index(_ccy)], label = _ccy)
+plt.xticks(list(filter(lambda num: num != 0, [dt if (dt.day-1)%5 == 0 else 0 for dt in \
+    _dataDict[_ccy]['PnL_Analysis'].date.unique()])))
+plt.xlabel('Datetime')
+plt.ylabel('%') 
+plt.legend()
+
+# Risk-adjusted Cumulative Return (%) for each ccy
+fig, ax1 = plt.subplots(figsize=(18, 5))
+color = plt.cm.rainbow(np.linspace(0, 1, len(_ccyList)))
+for _ccy in _ccyList:
+    ax1.plot(_dataDict[_ccy]['PnL_Analysis'].index, _dataDict[_ccy]['PnL_Analysis']['Risk-Adjusted Cumulative Return (%)'], 
+             color=color[_ccyList.index(_ccy)], label = _ccy)
+plt.xticks(list(filter(lambda num: num != 0, [dt if (dt.day-1)%5 == 0 else 0 for dt in \
+    _dataDict[_ccy]['PnL_Analysis'].date.unique()])))
+plt.xlabel('Datetime')
+plt.ylabel('%') 
+plt.legend()
+
+# Close vs Cum Return vs Risk-adjusted Cum Return
+for _ccy in _ccyList:
+    print(_ccy)
+    PnL = _dataDict[_ccy]['PnL_Analysis']
+    PnL['Close % Chg'] = (PnL.Close/PnL.Close[min(PnL.index)]-1)*100
+    fig, ax1 = plt.subplots(figsize=(18, 5))
+    ax1.plot(PnL.index, PnL['Close % Chg'], 'g-', label = 'Close % Chg')
+    ax1.plot(PnL.index, PnL['Cumulative Return (%)'], 'b-', label = 'Cumulative Return (%)')
+    ax1.plot(PnL.index, PnL['Risk-Adjusted Cumulative Return (%)'], 'r-', label = 'Risk-Adjusted Cumulative Return (%)')
+    plt.xticks(list(filter(lambda num: num != 0, [dt if (dt.day-1)%5 == 0 else 0 for dt in PnL.date.unique()])))
+    plt.xlabel('Datetime')
+    plt.ylabel('%') 
+    plt.legend()
+    plt.show()
